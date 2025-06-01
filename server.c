@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/select.h>
 #include "common.h" // Usaremos MAX_MSG_SIZE daqui
 
 #define SOCKET_ERROR -1 // Definindo um macro para erro de socket
@@ -19,15 +20,21 @@ void error_exit(const char *msg)
 
 int main(int argc, char *argv[])
 {
-    // 1. Validar e processar argumentos de linha de comando
+    // Args validation
     if (argc < 4)
     {
         fprintf(stderr, "Uso: %s <peer_ipv4> <p2p_port> <client_listen_port>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
-    // char *peer_ip = argv[1]; // Usaremos mais tarde
-    // int p2p_port = atoi(argv[2]); // Usaremos mais tarde
+    char *peer_target_ip = argv[1];
+    int common_p2p_port = atoi(argv[2]); // Esta é a porta P2P comum
     int client_listen_port = atoi(argv[3]);
+
+    // end args validation
+
+    // P2P configuration
+    int p2p_fd = -1;        // Socket para comunicação P2P estabelecida
+    int p2p_listen_fd = -1; // Socket para escutar conexões P2P se a ativa falhar
 
     printf("Servidor iniciando...\n");
     // printf("Peer IP: %s, P2P Port: %d, Client Listen Port: %d\n", peer_ip, p2p_port, client_listen_port);
@@ -70,56 +77,103 @@ int main(int argc, char *argv[])
     }
     printf("Servidor escutando na porta %d para conexões de clientes...\n", client_listen_port);
 
-    // 6. Aceitar uma conexão de cliente
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    int client_fd; // File descriptor para a conexão com o cliente
+    // Variables for Select
+    fd_set master_set, read_fds; // Master set of file descriptors and temporary set for select
+    int fd_max;                  // Max file descriptor number for select
 
-    printf("Aguardando conexão do cliente...\n");
-    if ((client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len)) == SOCKET_ERROR)
-    {
-        error_exit("Erro ao aceitar conexão do cliente");
-    }
-    // Exibir informações do cliente conectado
-    char client_ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_str, INET_ADDRSTRLEN);
-    printf("Cliente conectado: IP %s, Porta %d (fd: %d).\n", client_ip_str, ntohs(client_addr.sin_port), client_fd);
+    // Cleaning sets before using to avoid undefined behavior
+    FD_ZERO(&master_set);
+    FD_ZERO(&read_fds);
 
-    // 7. Receber uma mensagem do cliente
-    char buffer[MAX_MSG_SIZE];
-    memset(buffer, 0, MAX_MSG_SIZE);
-    ssize_t bytes_received;
+    // Adding the listening socket to the master socket set
+    // This allows us to monitor incoming connections on this socket
+    // This is the socket that will accept new client connections
+    // It will be the first socket to be monitored by select
+    FD_SET(listen_fd, &master_set);
 
-    printf("Aguardando mensagem do cliente...\n");
-    if ((bytes_received = recv(client_fd, buffer, MAX_MSG_SIZE - 1, 0)) == SOCKET_ERROR)
-    {
-        error_exit("Erro ao receber dados do cliente");
-    }
-    else if (bytes_received == 0)
-    {
-        printf("Cliente desconectou (recv retornou 0).\n");
-    }
-    else
-    {
-        buffer[bytes_received] = '\0'; // Garantir terminação nula da string
-        printf("Mensagem recebida do cliente: '%s' (%zd bytes)\n", buffer, bytes_received);
+    fd_max = listen_fd; // Initialize fd_max with the listening socket
 
-        // 8. Enviar uma mensagem de resposta ao cliente
-        const char *reply_msg = "Ola Cliente, mensagem recebida!";
-        printf("Enviando resposta para o cliente: '%s'\n", reply_msg);
-        if (send(client_fd, reply_msg, strlen(reply_msg), 0) == -1)
+    while (1)
+    {
+        read_fds = master_set; // Copy master set to read_fds for select
+
+        printf("Aguardando conexões...\n");
+
+        if (select(fd_max + 1, &read_fds, NULL, NULL, NULL) == SOCKET_ERROR)
         {
-            error_exit("Erro ao enviar resposta para o cliente");
+            error_exit("Erro ao chamar select");
         }
-        printf("Resposta enviada.\n");
+
+        printf("Atividade detectada!\n");
+
+        for (int i = 0; i <= fd_max; i++)
+        {
+            int has_activity = FD_ISSET(i, &read_fds);
+            if (!has_activity)
+                continue;
+
+            if (i == listen_fd)
+            {
+                struct sockaddr_in new_client_addr;
+                socklen_t new_client_addr_len = sizeof(new_client_addr);
+
+                int new_client_fd = accept(listen_fd, (struct sockaddr *)&new_client_addr, &new_client_addr_len);
+                if (new_client_fd == SOCKET_ERROR)
+                {
+                    perror("Erro ao aceitar nova conexão de cliente");
+                    continue;
+                }
+
+                FD_SET(new_client_fd, &master_set); // Add the new client socket to the master set
+
+                if (new_client_fd > fd_max)
+                    fd_max = new_client_fd; // Update fd_max if necessary
+
+                char client_ip[INET_ADDRSTRLEN];
+
+                if (inet_ntop(AF_INET, &new_client_addr.sin_addr, &client_ip, sizeof(client_ip)) == NULL)
+                {
+                    perror("Erro ao converter endereço IP do cliente");
+                    close(new_client_fd);
+                    continue;
+                }
+                printf("Novo cliente conectado: %s:%d (fd: %d)\n",
+                       client_ip, ntohs(new_client_addr.sin_port), new_client_fd);
+                continue;
+            }
+
+            char buffer[MAX_MSG_SIZE];
+            memset(buffer, 0, MAX_MSG_SIZE);
+            ssize_t bytes_received;
+
+            if ((bytes_received = recv(i, buffer, MAX_MSG_SIZE - 1, 0)) <= 0)
+            {
+                // Erro ou conexão fechada pelo cliente 'i'
+                if (bytes_received == 0)
+                    printf("Socket %d (cliente) desconectou.\n", i);
+                else
+                    perror("Erro no recv() do cliente");
+
+                close(i);
+                FD_CLR(i, &master_set);
+                continue;
+            }
+
+            buffer[bytes_received] = '\0'; // Null-terminate the received data
+            printf("Recebido do cliente (fd %d): %s\n", i, buffer);
+
+            char reply_msg[MAX_MSG_SIZE + 60];
+
+            snprintf(reply_msg, sizeof(reply_msg), "Mensagem recebida: %s", buffer);
+            ssize_t bytes_sent = send(i, reply_msg, strlen(reply_msg), 0);
+            if (bytes_sent == SOCKET_ERROR)
+            {
+                perror("Erro ao enviar resposta ao cliente");
+                close(i);
+                FD_CLR(i, &master_set);
+                continue;
+            }
+            printf("Resposta enviada ao cliente (fd %d): %s\n", i, reply_msg);
+        }
     }
-
-    // 9. Fechar os sockets
-    printf("Fechando socket do cliente (fd: %d).\n", client_fd);
-    close(client_fd);
-    printf("Fechando socket de escuta (fd: %d).\n", listen_fd);
-    close(listen_fd);
-
-    printf("Servidor encerrado.\n");
-    return 0;
 }
