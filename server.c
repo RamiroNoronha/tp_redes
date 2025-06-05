@@ -9,9 +9,11 @@
 #include <sys/select.h>
 #include "common.h" // Usaremos MAX_MSG_SIZE daqui
 
-#define SOCKET_ERROR -1 // Definindo um macro para erro de socket
+// SOCKET_ERROR is -1 because is the value returned by socket() and accept() when they fail
+#define SOCKET_ERROR -1
 
-// Função para auxiliar na exibição de erros e sair
+// Auxiliary function to handle errors and exit the program
+// This function prints the error message and exits the program with EXIT_FAILURE
 void error_exit(const char *msg)
 {
     perror(msg);
@@ -19,12 +21,12 @@ void error_exit(const char *msg)
 }
 
 /**
- * @brief Cria, configura (SO_REUSEADDR), vincula (bind) e coloca um socket em modo de escuta.
+ * @brief Function that centralizes the creation and configuration logic of a listening socket.
  *
- * @param port A porta na qual o socket deve escutar.
- * @param backlog O número máximo de conexões pendentes para listen().
- * @return O descritor do arquivo do socket de escuta em caso de sucesso,
- * ou SOCKET_ERROR (-1) em caso de falha (com perror já chamado).
+ * @param port The port number to bind the socket. For example, if I want to bind the socket to port 8080, I should pass 8080.
+ * @param backlog The max number of queue clients.
+ * @return THe socket file descriptor of the listening socket if successful, or
+ * SOCKET_ERROR if it fails (with perror already called).
  */
 int create_and_configure_listening_socket(int port, int backlog)
 {
@@ -32,14 +34,21 @@ int create_and_configure_listening_socket(int port, int backlog)
     struct sockaddr_in addr;
     int optval = 1;
 
-    // 1. Criar o socket
+    // 1. Create the socket, note that we are using IPv4 (AF_INET) and TCP (SOCK_STREAM)
+    // If the socket creation fails, it will return SOCKET_ERROR and perror will be called
+    // If the socket creation is successful, it will return a valid file descriptor (fd) for the socket
+    // That I can use to bind, listen, accept, etc.
+    // Note that I do not did the bind yet, just created the socket
     if ((new_listen_fd = socket(AF_INET, SOCK_STREAM, 0)) == SOCKET_ERROR)
     {
         perror("Erro ao criar socket de escuta na função");
         return SOCKET_ERROR;
     }
 
-    // 2. Configurar SO_REUSEADDR
+    // 2. Here we set the SO_REUSEADDR option to allow the socket to be reused
+    // This is useful to avoid the "Address already in use" error when restarting the server
+    // It allows the socket to be bound to the same address and port even if it is already in use
+    // If setsockopt fails, it will return SOCKET_ERROR
     if (setsockopt(new_listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == SOCKET_ERROR)
     {
         perror("Erro ao configurar SO_REUSEADDR na função");
@@ -47,13 +56,18 @@ int create_and_configure_listening_socket(int port, int backlog)
         return SOCKET_ERROR;
     }
 
-    // 3. Preparar a estrutura sockaddr_in
+    // 3. Prepare the sockaddr_in structure for binding
+    // This structure will hold the address and port information for the socket
+    // We set the family to AF_INET (IPv4), the address to INADDR_ANY (to accept connections from any IP),
+    // and the port to the specified port number (converted to network byte order with htons)
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
 
-    // 4. Vincular (bind) o socket à porta
+    // 4. Now is the bind step, where we bind the socket to the address and port
+    // If bind fails, it will return SOCKET_ERROR and perror will be called
+    // If bind is successful, the socket is ready to listen for incoming connections is the address and port specified
     if (bind(new_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
     {
         perror("Erro ao fazer bind na porta na função");
@@ -61,7 +75,10 @@ int create_and_configure_listening_socket(int port, int backlog)
         return SOCKET_ERROR;
     }
 
-    // 5. Colocar o socket em modo de escuta
+    // 5. This step puts the socket in listening mode
+    // Without this step, the socket cannot accept incoming connections and is just using the address and port
+    // If listen fails, it will return SOCKET_ERROR and perror will be called
+    // If listen is successful, the socket is ready to accept incoming connections
     if (listen(new_listen_fd, backlog) == SOCKET_ERROR)
     {
         perror("Erro ao colocar socket em modo de escuta na função");
@@ -74,14 +91,14 @@ int create_and_configure_listening_socket(int port, int backlog)
 }
 
 /**
- * @brief Tenta estabelecer uma conexão P2P, conectando-se ativamente ou configurando um socket de escuta.
+ * @brief This functions is responsible for initializing or reconfiguring the P2P link.
  *
- * @param peer_target_ip O IP do servidor peer para tentar a conexão ativa.
- * @param common_p2p_port A porta P2P comum para conexão e escuta.
- * @param p2p_fd_ptr Ponteiro para a variável que armazenará o FD da conexão P2P estabelecida.
- * @param p2p_listen_fd_ptr Ponteiro para a variável que armazenará o FD do socket de escuta P2P.
- * @param master_set_ptr Ponteiro para o conjunto mestre de FDs do select.
- * @param fd_max_ptr Ponteiro para o maior FD no conjunto mestre.
+ * @param peer_target_ip The IP address of the peer to connect to.
+ * @param common_p2p_port The port that the socket responsable for listening p2p connection will be.
+ * @param p2p_fd_ptr Pointer to the file description variable responsable for the p2p connection.
+ * @param p2p_listen_fd_ptr Pointer responsable for the file description connection that listen news p2p connections.
+ * @param master_set_ptr Pointer to the master socket set. It means, all the sockets that we are listening to.
+ * @param fd_max_ptr Pointer to the max file descriptor.
  */
 void initialize_p2p_link(const char *peer_target_ip, int common_p2p_port,
                          int *p2p_fd_ptr, int *p2p_listen_fd_ptr,
@@ -90,8 +107,8 @@ void initialize_p2p_link(const char *peer_target_ip, int common_p2p_port,
     printf("\n--- Configurando/Reiniciando Conexão P2P ---\n");
     printf("Tentando conectar ao peer %s na porta %d...\n", peer_target_ip, common_p2p_port);
 
-    // Garante que os FDs P2P anteriores (se houver) estão limpos antes de tentar uma nova configuração.
-    // Isso é importante se esta função for chamada para restabelecer uma conexão.
+    // First of all, we verify if the p2p_fd different of is diferent of -1. If so, it indicates that we do have a P2P connection
+    // And now we need to close it and reset the p2p_fd
     if (*p2p_fd_ptr != -1)
     {
         printf("Limpando p2p_fd existente: %d\n", *p2p_fd_ptr);
@@ -99,6 +116,10 @@ void initialize_p2p_link(const char *peer_target_ip, int common_p2p_port,
         close(*p2p_fd_ptr);
         *p2p_fd_ptr = -1;
     }
+
+    // If p2p_listen_fd is not -1, it means that we are listening for P2P connections
+    // and we need to close it and reset the p2p_listen_fd
+    // This is necessary because we are going to try to connect to a peer first
     if (*p2p_listen_fd_ptr != -1)
     {
         printf("Limpando p2p_listen_fd existente: %d\n", *p2p_listen_fd_ptr);
@@ -107,16 +128,15 @@ void initialize_p2p_link(const char *peer_target_ip, int common_p2p_port,
         *p2p_listen_fd_ptr = -1;
     }
 
+    // We create a temporary socket to try to connect to the peer before setting up a listening socket
+    // Note that if I got a connection, I will set the p2p_fd to the new socket
     int temp_p2p_socket;
+
+    // If the socket creation fails, it will return SOCKET_ERROR and finish the function
     if ((temp_p2p_socket = socket(AF_INET, SOCK_STREAM, 0)) == SOCKET_ERROR)
     {
-        // Não chamamos error_exit aqui para permitir que o servidor continue para clientes
         perror("Erro ao criar socket P2P para tentativa de conexão ativa");
-        // Tentar escutar P2P como fallback pode ser uma opção aqui, mas a lógica original
-        // tentava conectar primeiro, depois escutar. Se o socket falha, é um problema.
-        // Por ora, vamos manter o fluxo original e focar na falha do connect.
-        // Poderíamos decidir que, se o socket falhar, não há P2P por enquanto.
-        return; // Sai da função se não conseguir nem criar o socket de tentativa
+        return;
     }
 
     struct sockaddr_in peer_addr;
@@ -124,16 +144,20 @@ void initialize_p2p_link(const char *peer_target_ip, int common_p2p_port,
     peer_addr.sin_family = AF_INET;
     peer_addr.sin_port = htons(common_p2p_port);
 
+    // Convert the peer_target_ip string to a binary address
+    // If inet_pton fails, it will return a negative value and finish the function
     if (inet_pton(AF_INET, peer_target_ip, &peer_addr.sin_addr) <= 0)
     {
         perror("Erro ao converter endereço IP do peer para P2P");
         close(temp_p2p_socket);
-        return; // Sai se o IP for inválido
+        return;
     }
 
+    // Here I try to connect to the IP address and port of the peer in a active way. It means that I am trying to connect to the peer
     if (connect(temp_p2p_socket, (struct sockaddr *)&peer_addr, sizeof(peer_addr)) == 0)
-    { // Sucesso é 0
-        // Conexão P2P ativa bem-sucedida
+    {
+        // The temporary file descriptor was successfully connected to the peer
+        // And I can pointer to this value now using the p2p_fd_ptr
         *p2p_fd_ptr = temp_p2p_socket;
         FD_SET(*p2p_fd_ptr, master_set_ptr);
         if (*p2p_fd_ptr > *fd_max_ptr)
@@ -141,41 +165,42 @@ void initialize_p2p_link(const char *peer_target_ip, int common_p2p_port,
             *fd_max_ptr = *p2p_fd_ptr;
         }
         printf("Conectado com sucesso ao servidor peer (fd: %d).\n", *p2p_fd_ptr);
+        return;
     }
-    else
+
+    // I just arrives here if the connect() failed
+    // If the connection failed, I close the temporary socket
+    close(temp_p2p_socket);
+    perror("Falha ao conectar ativamente ao peer (ou peer não disponível)");
+
+    printf("Iniciando escuta P2P passiva na porta %d...\n", common_p2p_port);
+    // I can just me comunicate with one server at a time
+    int p2p_listen_backlog = 1;
+
+    // Now I create a listening socket for incoming P2P connections
+    *p2p_listen_fd_ptr = create_and_configure_listening_socket(common_p2p_port, p2p_listen_backlog);
+
+    // If the listening socket creation fails, it will return SOCKET_ERROR and finish the function
+    if (*p2p_listen_fd_ptr == SOCKET_ERROR)
     {
-        // Conexão P2P ativa falhou
-        close(temp_p2p_socket); // Fecha o socket que falhou ao conectar
-        perror("Falha ao conectar ativamente ao peer (ou peer não disponível)");
-
-        printf("Iniciando escuta P2P passiva na porta %d...\n", common_p2p_port);
-        int p2p_listen_backlog = 1; // P2P espera apenas 1 conexão
-        *p2p_listen_fd_ptr = create_and_configure_listening_socket(common_p2p_port, p2p_listen_backlog);
-
-        if (*p2p_listen_fd_ptr == SOCKET_ERROR)
-        {
-            fprintf(stderr, "Falha crítica ao tentar configurar escuta P2P passiva. P2P não estará disponível.\n");
-            // Não chama error_exit para permitir que o servidor continue para clientes
-        }
-        else
-        {
-            FD_SET(*p2p_listen_fd_ptr, master_set_ptr);
-            if (*p2p_listen_fd_ptr > *fd_max_ptr)
-            {
-                *fd_max_ptr = *p2p_listen_fd_ptr;
-            }
-            // A mensagem de sucesso da escuta já é impressa por create_and_configure_listening_socket
-        }
+        fprintf(stderr, "Falha crítica ao tentar configurar escuta P2P passiva. P2P não estará disponível.\n");
+        return;
     }
-    printf("--- Configuração/Reinicialização P2P Concluída ---\n");
+
+    // If the listening socket was created successfully, we add it to the master set
+    FD_SET(*p2p_listen_fd_ptr, master_set_ptr);
+    if (*p2p_listen_fd_ptr > *fd_max_ptr)
+    {
+        *fd_max_ptr = *p2p_listen_fd_ptr;
+    }
 }
 
 /**
- * @brief Aceita uma nova conexão de cliente e a adiciona ao conjunto mestre.
+ * @brief Functon responsable for accepting a new client connection, and adding it to master_set.
  *
- * @param main_listen_fd O socket de escuta principal para conexões de clientes.
- * @param master_set_ptr Ponteiro para o conjunto mestre de FDs.
- * @param fd_max_ptr Ponteiro para o maior FD no conjunto mestre.
+ * @param main_listen_fd Socket file descriptor responsable for listening new connections.
+ * @param master_set_ptr Pointer to master_set.
+ * @param fd_max_ptr Pointer to the max file descriptor in the master set.
  */
 void handle_new_client_connection(int main_listen_fd, fd_set *master_set_ptr, int *fd_max_ptr)
 {
@@ -183,13 +208,14 @@ void handle_new_client_connection(int main_listen_fd, fd_set *master_set_ptr, in
     socklen_t new_client_addr_len = sizeof(new_client_addr);
     int new_client_fd;
 
-    new_client_fd = accept(main_listen_fd, (struct sockaddr *)&new_client_addr, &new_client_addr_len);
-    if (new_client_fd == SOCKET_ERROR)
+    // Accept a new client connection and if it fails, I finish the function
+    if ((new_client_fd = accept(main_listen_fd, (struct sockaddr *)&new_client_addr, &new_client_addr_len)) == SOCKET_ERROR)
     {
         perror("Erro ao aceitar nova conexão de cliente");
-        return; // Retorna sem adicionar nada se o accept falhar
+        return;
     }
 
+    // Put the new client socket in the master set
     FD_SET(new_client_fd, master_set_ptr);
     if (new_client_fd > *fd_max_ptr)
     {
@@ -197,30 +223,26 @@ void handle_new_client_connection(int main_listen_fd, fd_set *master_set_ptr, in
     }
 
     char client_ip[INET_ADDRSTRLEN];
+    // Convert the new client's IP address to a string just for logging
     if (inet_ntop(AF_INET, &new_client_addr.sin_addr, client_ip, sizeof(client_ip)) == NULL)
     {
         perror("Erro ao converter endereço IP do novo cliente");
-        // Mesmo com erro no inet_ntop, o socket foi aceito e adicionado.
-        // Poderíamos fechar e remover se o log do IP for crítico.
-        // Por ora, apenas logamos o erro.
         printf("Novo cliente conectado (fd: %d), erro ao obter IP.\n", new_client_fd);
+        return;
     }
-    else
-    {
-        printf("Novo cliente conectado: %s:%d (fd: %d)\n",
-               client_ip, ntohs(new_client_addr.sin_port), new_client_fd);
-    }
+
+    printf("Novo cliente conectado: %s:%d (fd: %d)\n",
+           client_ip, ntohs(new_client_addr.sin_port), new_client_fd);
 }
 
 /**
- * @brief Aceita uma conexão P2P entrante, configura o socket de comunicação P2P
- * e desativa o socket de escuta P2P.
+ * @brief Function responsable for accepting an incoming P2P connection on the listening socket and closing the listening socket to not accept new connections.
  *
- * @param current_p2p_listen_fd O socket de escuta P2P que teve atividade.
- * @param p2p_comm_fd_main_ptr Ponteiro para a variável p2p_fd da main (para armazenar o novo FD de comunicação).
- * @param p2p_listen_fd_main_ptr Ponteiro para a variável p2p_listen_fd da main (para ser resetada para -1).
- * @param master_set_ptr Ponteiro para o conjunto mestre de FDs.
- * @param fd_max_ptr Ponteiro para o maior FD no conjunto mestre.
+ * @param current_p2p_listen_fd The P2P listening socket that had activity.
+ * @param p2p_comm_fd_main_ptr Pointer to the main p2p_fd variable (to store the new communication FD).
+ * @param p2p_listen_fd_main_ptr Pointer to the main p2p_listen_fd variable (to be reset to -1).
+ * @param master_set_ptr Pointer to the master set of FDs.
+ * @param fd_max_ptr Pointer to the highest FD in the master set.
  */
 void handle_incoming_p2p_connection(int current_p2p_listen_fd, int *p2p_comm_fd_main_ptr,
                                     int *p2p_listen_fd_main_ptr,
@@ -231,14 +253,16 @@ void handle_incoming_p2p_connection(int current_p2p_listen_fd, int *p2p_comm_fd_
     socklen_t incoming_peer_addr_len = sizeof(incoming_peer_addr);
     int accepted_p2p_comm_fd;
 
-    accepted_p2p_comm_fd = accept(current_p2p_listen_fd, (struct sockaddr *)&incoming_peer_addr, &incoming_peer_addr_len);
-    if (accepted_p2p_comm_fd == SOCKET_ERROR)
+    // Accept the incoming P2P connection
+    // If accept() fails finish the function
+    if ((accepted_p2p_comm_fd = accept(current_p2p_listen_fd, (struct sockaddr *)&incoming_peer_addr, &incoming_peer_addr_len)) == SOCKET_ERROR)
     {
         perror("Erro ao aceitar conexão P2P entrante");
         return;
     }
 
     char peer_ip[INET_ADDRSTRLEN];
+    // Convert the incoming peer's IP address to a string for logging
     if (inet_ntop(AF_INET, &incoming_peer_addr.sin_addr, peer_ip, sizeof(peer_ip)) == NULL)
     {
         perror("Erro ao converter endereço IP do peer (conexão P2P aceita)");
@@ -250,15 +274,21 @@ void handle_incoming_p2p_connection(int current_p2p_listen_fd, int *p2p_comm_fd_
                peer_ip, ntohs(incoming_peer_addr.sin_port), accepted_p2p_comm_fd);
     }
 
+    // If p2p_comm_fd_main_ptr is not -1, it means that we already have a P2P connection established
+    // In this case, we close the new accepted connection and keep the existing one
+    // This is to ensure that we only have one active P2P connection at a time
+    // If p2p_comm_fd_main_ptr is -1, it means that we do not have a P2P connection established
+    // and we can set the new accepted connection as the active P2P communication socket
     if (*p2p_comm_fd_main_ptr != -1)
-    { // Verifica se já existe uma conexão P2P principal
+    {
         printf("AVISO: Conexão P2P principal já existente (fd: %d). Fechando nova tentativa de conexão P2P (fd: %d).\n",
                *p2p_comm_fd_main_ptr, accepted_p2p_comm_fd);
         close(accepted_p2p_comm_fd);
     }
     else
     {
-        // Define o novo socket de comunicação P2P
+        // If we reach here, it means that we successfully accepted a new P2P connection and we do not have a before connection
+        // We set the accepted P2P communication socket as the main P2P communication socket
         *p2p_comm_fd_main_ptr = accepted_p2p_comm_fd;
         FD_SET(*p2p_comm_fd_main_ptr, master_set_ptr);
         if (*p2p_comm_fd_main_ptr > *fd_max_ptr)
@@ -267,22 +297,20 @@ void handle_incoming_p2p_connection(int current_p2p_listen_fd, int *p2p_comm_fd_
         }
         printf("Socket de comunicação P2P estabelecido através de escuta (fd: %d).\n", *p2p_comm_fd_main_ptr);
 
-        // Como a conexão P2P foi estabelecida, paramos de escutar por novas conexões P2P.
         printf("Fechando socket de escuta P2P (original fd: %d) e removendo do master_set.\n", current_p2p_listen_fd);
+        // Close the listening socket since we are now connected to a peer
         FD_CLR(current_p2p_listen_fd, master_set_ptr);
         close(current_p2p_listen_fd);
-        *p2p_listen_fd_main_ptr = -1; // Indica que não estamos mais escutando P2P
+        *p2p_listen_fd_main_ptr = -1;
     }
 }
 
 /**
- * @brief Processa dados recebidos ou desconexão em um socket P2P de comunicação estabelecido.
+ * @brief Processes data received or disconnection on an established P2P communication socket.
  *
- * @param current_p2p_comm_fd O socket P2P de comunicação que teve atividade.
- * @param p2p_comm_fd_main_ptr Ponteiro para a variável p2p_fd da main (para ser resetada para -1 em caso de desconexão).
- * @param master_set_ptr Ponteiro para o conjunto mestre de FDs.
- * // Não precisamos mais de p2p_listen_fd_main_ptr ou dos args de porta aqui,
- * // pois a lógica de restabelecimento foi movida para o topo do while(1) e usa initialize_p2p_link.
+ * @param current_p2p_comm_fd The P2P communication socket that had activity.
+ * @param p2p_comm_fd_main_ptr Pointer to the main p2p_fd variable (to be reset to -1 in case of disconnection).
+ * @param master_set_ptr Pointer to the master set of FDs.
  */
 void handle_p2p_communication(int current_p2p_comm_fd, int *p2p_comm_fd_main_ptr,
                               fd_set *master_set_ptr)
@@ -291,9 +319,9 @@ void handle_p2p_communication(int current_p2p_comm_fd, int *p2p_comm_fd_main_ptr
     memset(p2p_buffer, 0, MAX_MSG_SIZE);
     ssize_t p2p_bytes_received;
 
-    p2p_bytes_received = recv(current_p2p_comm_fd, p2p_buffer, MAX_MSG_SIZE - 1, 0);
-
-    if (p2p_bytes_received <= 0)
+    // Attempt to receive data from the P2P communication socket
+    // If recv() fails, it will return a negative value. If retuns 0, the other server disconnecte. In both case I handle the disconnection
+    if ((p2p_bytes_received = recv(current_p2p_comm_fd, p2p_buffer, MAX_MSG_SIZE - 1, 0)) <= 0)
     {
         if (p2p_bytes_received == 0)
         {
@@ -305,26 +333,22 @@ void handle_p2p_communication(int current_p2p_comm_fd, int *p2p_comm_fd_main_ptr
         }
         close(current_p2p_comm_fd);
         FD_CLR(current_p2p_comm_fd, master_set_ptr);
-        *p2p_comm_fd_main_ptr = -1; // Indica que a conexão P2P ativa foi perdida
+        *p2p_comm_fd_main_ptr = -1;
 
         printf("Conexão P2P (original fd: %d) terminada. Tentativa de restabelecimento ocorrerá no próximo ciclo.\n", current_p2p_comm_fd);
-        // A lógica no início do while(1) (if p2p_fd == -1 && p2p_listen_fd == -1)
-        // cuidará de chamar initialize_p2p_link() para tentar restabelecer.
+        return;
     }
-    else
-    {
-        p2p_buffer[p2p_bytes_received] = '\0';
-        printf("Recebido do peer (fd %d): '%s'\n", current_p2p_comm_fd, p2p_buffer);
-        // Futuramente: Lógica para tratar mensagens de protocolo P2P (REQ_CONNPEER, etc.)
-    }
+
+    // If we reach here, it means that we successfully received data from the P2P communication socket
+    p2p_buffer[p2p_bytes_received] = '\0';
+    printf("Recebido do peer (fd %d): '%s'\n", current_p2p_comm_fd, p2p_buffer);
 }
 
 /**
- * @brief Processa dados recebidos ou desconexão em um socket de cliente estabelecido.
+ * @brief Processes data received or disconnection on an established client socket.
  *
- * @param client_socket_fd O socket do cliente que teve atividade.
- * @param master_set_ptr Ponteiro para o conjunto mestre de FDs.
- * // fd_max_ptr poderia ser passado se quiséssemos recalcular fd_max ao fechar, mas é opcional.
+ * @param client_socket_fd The client socket that had activity.
+ * @param master_set_ptr Pointer to the master set of FDs.
  */
 void handle_client_communication(int client_socket_fd, fd_set *master_set_ptr)
 {
@@ -332,9 +356,7 @@ void handle_client_communication(int client_socket_fd, fd_set *master_set_ptr)
     memset(buffer, 0, MAX_MSG_SIZE);
     ssize_t bytes_received;
 
-    bytes_received = recv(client_socket_fd, buffer, MAX_MSG_SIZE - 1, 0);
-
-    if (bytes_received <= 0)
+    if ((bytes_received = recv(client_socket_fd, buffer, MAX_MSG_SIZE - 1, 0)) <= 0)
     {
         if (bytes_received == 0)
         {
@@ -344,33 +366,32 @@ void handle_client_communication(int client_socket_fd, fd_set *master_set_ptr)
         {
             perror("Erro no recv() do cliente");
         }
+
+        // Close the client socket and remove it from the master set
         close(client_socket_fd);
         FD_CLR(client_socket_fd, master_set_ptr);
-        // Opcional: Se client_socket_fd == *fd_max_ptr, você precisaria varrer master_set_ptr
-        // para encontrar o novo fd_max. Por simplicidade, podemos omitir isso por enquanto,
-        // já que fd_max só cresce e select() lida bem com isso (embora menos eficiente).
+        return;
+    }
+
+    // If we reach here, it means that we successfully received data from the client socket
+    buffer[bytes_received] = '\0';
+    printf("Recebido do cliente (fd %d): %s\n", client_socket_fd, buffer);
+
+    // Simple answer generated by AI for tests
+    char reply_msg[MAX_MSG_SIZE + 60];
+    snprintf(reply_msg, sizeof(reply_msg), "Servidor: Msg recebida do cliente %d: '%s'", client_socket_fd, buffer);
+
+    ssize_t bytes_sent = send(client_socket_fd, reply_msg, strlen(reply_msg), 0);
+    if (bytes_sent == SOCKET_ERROR)
+    {
+        perror("Erro ao enviar resposta ao cliente");
+        // Considere fechar este cliente se o send falhar
+        close(client_socket_fd);
+        FD_CLR(client_socket_fd, master_set_ptr);
     }
     else
     {
-        buffer[bytes_received] = '\0';
-        printf("Recebido do cliente (fd %d): %s\n", client_socket_fd, buffer);
-
-        // Lógica de resposta simples (eco ou mensagem de confirmação)
-        char reply_msg[MAX_MSG_SIZE + 60];
-        snprintf(reply_msg, sizeof(reply_msg), "Servidor: Msg recebida do cliente %d: '%s'", client_socket_fd, buffer);
-
-        ssize_t bytes_sent = send(client_socket_fd, reply_msg, strlen(reply_msg), 0);
-        if (bytes_sent == SOCKET_ERROR)
-        {
-            perror("Erro ao enviar resposta ao cliente");
-            // Considere fechar este cliente se o send falhar
-            close(client_socket_fd);
-            FD_CLR(client_socket_fd, master_set_ptr);
-        }
-        else
-        {
-            printf("Resposta enviada ao cliente (fd %d): '%s'\n", client_socket_fd, reply_msg);
-        }
+        printf("Resposta enviada ao cliente (fd %d): '%s'\n", client_socket_fd, reply_msg);
     }
 }
 
@@ -388,15 +409,31 @@ int main(int argc, char *argv[])
     // end args validation
 
     // P2P configuration
-    int p2p_fd = -1;        // Socket para comunicação P2P estabelecida
-    int p2p_listen_fd = -1; // Socket para escutar conexões P2P se a ativa falhar
-    int optval = 1;         // optval para setsockopt, usado em create_and_configure_listening_socket e P2P connect setup
+
+    // Socket that indicated the active P2P connection
+    // When the connection is active, the value is != -1
+    // When the value is -1, it means that we are not connected to a peer
+    // Notice that if p2p_fd is -1, probably p2p_listen_fd is not -1, because we are listening for incoming P2P connections
+    // And if p2p_fd is not -1, then p2p_listen_fd is -1, because we are already connected to a peer
+    int p2p_fd = -1;
+
+    // Socket responsable for listening incoming P2P connections
+    // Whne this values is -1, it means that we are not listening for P2P connections. It happens when we are connected to a peer
+    // That indicates that the connection is closed, because my server just connects to one server at a time
+    // Notice that if p2p_fd is -1, probably p2p_listen_fd is not -1, because we are listening for incoming P2P connections
+    // And if p2p_fd is not -1, then p2p_listen_fd is -1, because we are already connected to a peer
+    int p2p_listen_fd = -1;
 
     printf("Servidor iniciando...\n");
 
-    // Configurar socket de escuta para clientes
+    // Socket responsible for listening to clients
+    // This socket is used to accept new client connections
     int listen_fd;
-    int client_backlog = 10; // Aumentado um pouco o backlog para clientes
+
+    // Backlog for clients
+    // This values indicated that the maximum number of pending connections is 10
+    int client_backlog = 10;
+
     printf("Configurando socket de escuta para clientes na porta %d...\n", client_listen_port);
     listen_fd = create_and_configure_listening_socket(client_listen_port, client_backlog);
     if (listen_fd == SOCKET_ERROR)
@@ -404,12 +441,18 @@ int main(int argc, char *argv[])
         error_exit("Falha crítica ao configurar socket de escuta para clientes");
     }
 
-    // Variables for Select
+    // Here we initialize the sockets file descriptor sets
+    // [master_set] will contain all the sockets that we are listening to
+    // [read_fds] will be used by select() to indicate which sockets have activity
     fd_set master_set, read_fds;
+
+    // fd_max will be used by select() to indicate the maximum file descriptor that we are listening to
+    // It is necessary to iterate through all the sockets in master_set
     int fd_max;
 
     FD_ZERO(&master_set);
     FD_ZERO(&read_fds);
+
     FD_SET(listen_fd, &master_set);
     fd_max = listen_fd;
 
@@ -430,32 +473,55 @@ int main(int argc, char *argv[])
         read_fds = master_set;
         printf("\nAguardando atividade nos sockets...\n");
 
+        // The select() function blocks until one or more sockets in the master_set have activity
+        // It will modify read_fds to indicate which sockets have activity
+        // If select() returns, it means at least one socket has activity or an error occurred
         if (select(fd_max + 1, &read_fds, NULL, NULL, NULL) == SOCKET_ERROR)
         {
-            error_exit("Erro crítico no select"); // Pode ser interrompido por sinal, tratar EINTR em produção
+            error_exit("Erro crítico no select");
         }
         printf("Atividade detectada!\n");
 
+        // This loop just occurs when select() returns, meaning there is activity on at least one socket
+        // We iterate through all possible file descriptors to check which ones have activity
+        // fd_max is the highest file descriptor in the master_set, so we iterate from 0 to fd_max
+        // This is necessary because select() does not return the specific file descriptors that have activity,
+        // it only tells us that at least one of them has activity.
         for (int i = 0; i <= fd_max; i++)
         {
-            if (FD_ISSET(i, &read_fds)) // Somente processa se 'i' tem atividade
+            // FD_ISSET verify if the i socket has activity
+            // This information is stored in read_fds, which was modified by select()
+            // If the socket i does not have activity, skip to the next iteration
+            int has_i_socket_active = FD_ISSET(i, &read_fds);
+            if (!has_i_socket_active)
+                continue;
+
+            // When the loop reaches here, it means that listen_fd
+            // that is the main socket for clients
+            // is receiving a new connection
+            if (i == listen_fd)
             {
-                if (i == listen_fd)
-                {
-                    handle_new_client_connection(listen_fd, &master_set, &fd_max);
-                }
-                else if (p2p_listen_fd != -1 && i == p2p_listen_fd)
-                {
-                    handle_incoming_p2p_connection(i, &p2p_fd, &p2p_listen_fd, &master_set, &fd_max);
-                }
-                else if (p2p_fd != -1 && i == p2p_fd)
-                {
-                    handle_p2p_communication(i, &p2p_fd, &master_set);
-                }
-                else
-                {
-                    handle_client_communication(i, &master_set);
-                }
+                handle_new_client_connection(listen_fd, &master_set, &fd_max);
+            }
+            // If p2p_listen_fd is not -1, it means that we are listening for P2P connections
+            // and we check if the current socket is the P2P listen socket
+            // I did the p2p_listen_fd != -1 first just to indicate that we are listening for P2P connections
+            else if (p2p_listen_fd != -1 && i == p2p_listen_fd)
+            {
+                handle_incoming_p2p_connection(i, &p2p_fd, &p2p_listen_fd, &master_set, &fd_max);
+            }
+            // If p2p_fd is not -1, it means that we have an active P2P connection
+            // and we check if the current socket is the P2P communication socket
+            // If i == p2p_fd, it means that we have activity on the P2P communication socket and we can read data from it
+            else if (p2p_fd != -1 && i == p2p_fd)
+            {
+                handle_p2p_communication(i, &p2p_fd, &master_set);
+            }
+            // The last scenario is when the we do not have a p2p connections either we have a new connection
+            // That indicate that the client is just sedind data or disconnecting
+            else
+            {
+                handle_client_communication(i, &master_set);
             }
         }
     }
