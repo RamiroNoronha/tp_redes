@@ -81,18 +81,17 @@ void build_message(char *buffer_destination, size_t buffer_size, int code,
  * @param destination_payload2 Buffer to get the socond payload.
  * @return The number of filds read from the message:
  */
-ParseResultType analisar_mensagem(const char *buffer_origin, int *destination_code,
-                                  char *destination_payload1, char *destination_payload2)
+ParseResultType parse_message(const char *buffer_origin, int *destination_code,
+                              char *destination_payload1, char *destination_payload2)
 {
+
     // Cleaning the destination buffers to ensure they start empty
     if (destination_payload1)
-    {
         destination_payload1[0] = '\0';
-    }
     if (destination_payload2)
-    {
         destination_payload2[0] = '\0';
-    }
+    if (destination_code)
+        *destination_code = -1;
 
     int read_items = 0;
 
@@ -113,12 +112,12 @@ ParseResultType analisar_mensagem(const char *buffer_origin, int *destination_co
     read_items = sscanf(buffer_origin, "%d", destination_code);
     if (read_items == 1)
     {
-        return PARSE_ERROR_INVALID_FORMAT; 
+        return PARSE_SUCCESS_CODE_ONLY;
     }
 
     // If we reach here, it means that the message format is not recognized
     fprintf(stderr, "Erro ao analisar mensagem: formato não reconhecido em \"%s\"\n", buffer_origin);
-    return -1;
+    return PARSE_ERROR_INVALID_FORMAT;
 }
 
 /**
