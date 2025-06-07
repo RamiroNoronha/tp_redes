@@ -13,6 +13,14 @@
 // SOCKET_ERROR is -1 because is the value returned by socket() and accept() when they fail
 #define SOCKET_ERROR -1
 
+typedef enum
+{
+    PARSE_ERROR_INVALID_FORMAT = -1,
+    PARSE_SUCCESS_CODE_ONLY = 1,   // Only the code was read
+    PARSE_SUCCESS_ONE_PAYLOAD = 2, // Code and payload1 were read
+    PARSE_SUCCESS_TWO_PAYLOADS = 3 // Code, payload1 and payload2 were read
+} ParseResultType;
+
 // Auxiliary function to handle errors and exit the program
 // This function prints the error message and exits the program with EXIT_FAILURE
 void error_exit(const char *msg)
@@ -24,17 +32,17 @@ void error_exit(const char *msg)
 /**
  * @brief Function responsable for creating a destination message buffer
  *
- * @param buffer_destino A pointer for the destination buffer where the message will be built.
+ * @param buffer_destination A pointer for the destination buffer where the message will be built.
  * @param buffer_size The size of the destination buffer. It is used to avoid buffer overflow.
- * @param codigo The code number of the message.
+ * @param code The code number of the message.
  * @param payload1 The first payload (string). It's is nullable
  * @param payload2 The second payload (string). It's is nullable
  */
-void build_message(char *buffer_destino, size_t buffer_size, int codigo,
+void build_message(char *buffer_destination, size_t buffer_size, int code,
                    const char *payload1, const char *payload2)
 {
     // 1. Clean the buffer to ensure no garbage data remains.
-    memset(buffer_destino, 0, buffer_size);
+    memset(buffer_destination, 0, buffer_size);
 
     int bytes_escritos = 0;
 
@@ -42,19 +50,19 @@ void build_message(char *buffer_destino, size_t buffer_size, int codigo,
     // snprintf is a function responsable for formmating the buffer message respecting the buffer size.
     if (payload1 != NULL && payload2 != NULL)
     {
-        bytes_escritos = snprintf(buffer_destino, buffer_size, "%d %s %s", codigo, payload1, payload2);
-        }
+        bytes_escritos = snprintf(buffer_destination, buffer_size, "%d %s %s", code, payload1, payload2);
+    }
     else if (payload1 != NULL)
     {
-        bytes_escritos = snprintf(buffer_destino, buffer_size, "%d %s", codigo, payload1);
+        bytes_escritos = snprintf(buffer_destination, buffer_size, "%d %s", code, payload1);
     }
     else if (payload2 != NULL)
     {
-        bytes_escritos = snprintf(buffer_destino, buffer_size, "%d %s", codigo, payload2);
+        bytes_escritos = snprintf(buffer_destination, buffer_size, "%d %s", code, payload2);
     }
     else
     {
-        bytes_escritos = snprintf(buffer_destino, buffer_size, "%d", codigo);
+        bytes_escritos = snprintf(buffer_destination, buffer_size, "%d", code);
     }
 
     // 3. Verifying if the message was truncated
@@ -62,6 +70,55 @@ void build_message(char *buffer_destino, size_t buffer_size, int codigo,
     {
         fprintf(stderr, "AVISO: A mensagem construída foi truncada (limite de %zu bytes).\n", buffer_size);
     }
+}
+
+/**
+ * @brief Analisa uma string de mensagem recebida e extrai o código e os payloads.
+ *
+ * @param buffer_origin The string message received from the client or peer.
+ * @param destination_code Pointer to the int that will keep the code.
+ * @param destination_payload1 Buffer to get the first payload.
+ * @param destination_payload2 Buffer to get the socond payload.
+ * @return The number of filds read from the message:
+ */
+ParseResultType analisar_mensagem(const char *buffer_origin, int *destination_code,
+                                  char *destination_payload1, char *destination_payload2)
+{
+    // Cleaning the destination buffers to ensure they start empty
+    if (destination_payload1)
+    {
+        destination_payload1[0] = '\0';
+    }
+    if (destination_payload2)
+    {
+        destination_payload2[0] = '\0';
+    }
+
+    int read_items = 0;
+
+    // Tryies to fit the message in one of the expected formats
+
+    read_items = sscanf(buffer_origin, "%d %s %s", destination_code, destination_payload1, destination_payload2);
+    if (read_items == 3)
+    {
+        return PARSE_SUCCESS_TWO_PAYLOADS;
+    }
+
+    read_items = sscanf(buffer_origin, "%d %s", destination_code, destination_payload1);
+    if (read_items == 2)
+    {
+        return PARSE_SUCCESS_ONE_PAYLOAD;
+    }
+
+    read_items = sscanf(buffer_origin, "%d", destination_code);
+    if (read_items == 1)
+    {
+        return PARSE_ERROR_INVALID_FORMAT; 
+    }
+
+    // If we reach here, it means that the message format is not recognized
+    fprintf(stderr, "Erro ao analisar mensagem: formato não reconhecido em \"%s\"\n", buffer_origin);
+    return -1;
 }
 
 /**
