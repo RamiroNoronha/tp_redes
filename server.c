@@ -7,7 +7,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
-#include "common.h" // Usaremos MAX_MSG_SIZE daqui
+#include "common.h"
+#include <stddef.h>
 
 // SOCKET_ERROR is -1 because is the value returned by socket() and accept() when they fail
 #define SOCKET_ERROR -1
@@ -18,6 +19,49 @@ void error_exit(const char *msg)
 {
     perror(msg);
     exit(EXIT_FAILURE);
+}
+
+/**
+ * @brief Function responsable for creating a destination message buffer
+ *
+ * @param buffer_destino A pointer for the destination buffer where the message will be built.
+ * @param buffer_size The size of the destination buffer. It is used to avoid buffer overflow.
+ * @param codigo The code number of the message.
+ * @param payload1 The first payload (string). It's is nullable
+ * @param payload2 The second payload (string). It's is nullable
+ */
+void build_message(char *buffer_destino, size_t buffer_size, int codigo,
+                   const char *payload1, const char *payload2)
+{
+    // 1. Clean the buffer to ensure no garbage data remains.
+    memset(buffer_destino, 0, buffer_size);
+
+    int bytes_escritos = 0;
+
+    // 2. Builds the message based on the provided code and payloads
+    // snprintf is a function responsable for formmating the buffer message respecting the buffer size.
+    if (payload1 != NULL && payload2 != NULL)
+    {
+        bytes_escritos = snprintf(buffer_destino, buffer_size, "%d %s %s", codigo, payload1, payload2);
+        }
+    else if (payload1 != NULL)
+    {
+        bytes_escritos = snprintf(buffer_destino, buffer_size, "%d %s", codigo, payload1);
+    }
+    else if (payload2 != NULL)
+    {
+        bytes_escritos = snprintf(buffer_destino, buffer_size, "%d %s", codigo, payload2);
+    }
+    else
+    {
+        bytes_escritos = snprintf(buffer_destino, buffer_size, "%d", codigo);
+    }
+
+    // 3. Verifying if the message was truncated
+    if (bytes_escritos >= buffer_size)
+    {
+        fprintf(stderr, "AVISO: A mensagem construída foi truncada (limite de %zu bytes).\n", buffer_size);
+    }
 }
 
 /**
