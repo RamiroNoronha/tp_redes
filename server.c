@@ -435,6 +435,8 @@ void handle_check_failure_command(int source_fd, char p1[256], SensorInfo *senso
 
 void handle_check_alert_request(SensorInfo *sensors_array, char p1[256], int source_fd, char send_buffer[500]);
 
+void handle_disconnect_request(SensorInfo *sensors_array, char p1[256], char send_buffer[500], int source_fd, int *sensor_count_ptr, fd_set *master_set_ptr);
+
 void handle_check_alert_response(int source_fd, const char *location_payload,
                                  SensorInfo *sensors_array, char *send_buffer,
                                  PendingRequest *pending_requests_array)
@@ -462,18 +464,22 @@ void handle_check_alert_response(int source_fd, const char *location_payload,
     }
     else
     {
-        // Recebemos uma resposta do SL mas não tínhamos nenhum pedido pendente registado.
         fprintf(stderr, "[SS] AVISO: Recebido RES_CHECKALERT mas não há pedidos pendentes registados.\n");
     }
 }
 
 /**
- * @brief Processa qualquer mensagem recebida, seja de um cliente ou de um peer.
- * Esta função age como o cérebro do protocolo do servidor.
- * @param source_fd O socket de onde a mensagem se originou.
- * @param received_buffer A string de mensagem bruta recebida.
- * @param server_state Ponteiros e variáveis que representam o estado atual do servidor.
- * (Esta parte será mais formalizada no futuro com uma struct de estado)
+ * @brief Processes any incoming message, whether from a client or a peer.
+ * This function acts as the protocol brain of the server.
+ * @param source_fd The socket from which the message originated.
+ * @param received_buffer The raw message string received.
+ * @param p2p_handshake_complete_ptr Pointer to the P2P handshake completion flag (can be NULL for clients).
+ * @param master_set_ptr Pointer to the master set of file descriptors.
+ * @param p2p_fd_ptr Pointer to the P2P connection file descriptor.
+ * @param sensors_array Array of connected sensors.
+ * @param sensor_count_ptr Pointer to the current number of connected sensors.
+ * @param next_sensor_id_ptr Pointer to the next sensor ID value.
+ * @param pending_requests_array Array of pending P2P requests.
  */
 void process_incoming_message(int source_fd, const char *received_buffer, int *p2p_handshake_complete_ptr,
                               fd_set *master_set_ptr, int *p2p_fd_ptr,
@@ -484,7 +490,6 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
     char p1[256], p2[256];
     char send_buffer[MAX_MSG_SIZE];
 
-    // 1. Analisa a mensagem para obter o código e os payloads
     ParseResultType result = parse_message(received_buffer, &received_code, p1, p2);
 
     if (result == PARSE_ERROR_INVALID_FORMAT)
@@ -493,11 +498,9 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         return;
     }
 
-    // 2. Processa a mensagem com base no código
     printf("[SERVER] Processando código %d do fd %d.\n", received_code, source_fd);
     switch (received_code)
     {
-        // --- Mensagens de Controle (Cliente -> Servidor) ---
     case REQ_CONNSEN: // Código 23
         printf("[SERVER] Recebido REQ_CONNSEN do fd %d com LocId=%s\n", source_fd, p1);
         if (*sensor_count_ptr >= MAX_CLIENTS)
@@ -507,11 +510,12 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         break;
 
     case REQ_DISCSEN: // 25
-        printf(">> Lógica para REQ_DISCSEN (desconectar sensor) aqui.\n");
-        break;
+        printf("[SERVER] Recebido REQ_DISCSEN do sensor ID %s (fd: %d).\n", p1, source_fd);
 
-    // --- Mensagens de Dados (Cliente -> Servidor) ---
-    case REQ_SENSLOC: // 38 (para Servidor de Localização)
+        handle_disconnect_request(sensors_array, p1, send_buffer, source_fd, sensor_count_ptr, master_set_ptr);
+
+        break;
+    case REQ_SENSLOC: // 38
         if (my_role != ROLE_LOCATION_SERVER)
         {
             fprintf(stderr, "[SERVER] REQ_SENSLOC recebido em um servidor que não é o Servidor de Localização. Ignorando.\n");
@@ -531,12 +535,10 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         send(source_fd, send_buffer, strlen(send_buffer), 0);
         break;
 
-    // --- NOVO: Bloco unificado para o código 40 ---
-    case 40: // Código compartilhado para REQ_SENSSTATUS e REQ_LOCLIST
+    case 40: //  REQ_SENSSTATUS e REQ_LOCLIST
         if (my_role == ROLE_STATUS_SERVER)
         {
             printf(">> Lógica para REQ_SENSSTATUS (check failure) aqui.\n");
-            // Mensagem com 1 payload só pode ser REQ_SENSSTATUS
             handle_check_failure_command(source_fd, p1, sensors_array, p2p_fd_ptr, pending_requests_array);
         }
         else if (my_role == ROLE_LOCATION_SERVER)
@@ -551,12 +553,9 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         }
         break;
 
-    // --- Mensagens de Controle (Peer -> Peer) ---
     case REQ_CONNPEER: // 20
         printf("[P2P] Recebido REQ_CONNPEER do peer (fd: %d).\n", source_fd);
 
-        // Conforme o PDF, o servidor define um ID para o peer e responde.
-        // Por agora, vamos usar um ID estático para o teste.
         const char *peer_id_para_resposta = "PEER_ID_1";
 
         printf("[P2P] A responder com RES_CONNPEER para o peer (fd: %d)\n", source_fd);
@@ -592,7 +591,17 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         break;
 
     case REQ_DISCPEER: // 22
-        printf(">> Lógica para REQ_DISCPEER (pedido de desconexão P2P) aqui.\n");
+        printf("[P2P] Recebido pedido de desconexão REQ_DISCPEER do peer (fd: %d).\n", source_fd);
+
+        printf("[P2P] A enviar confirmação OK(01) para o peer.\n");
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_OK, "1", NULL); // OK_SUCCESSFUL_DISCONNECT
+        send(source_fd, send_buffer, strlen(send_buffer), 0);
+
+        printf("[P2P] A fechar a ligação P2P (fd: %d) do nosso lado.\n", source_fd);
+        close(source_fd);
+        FD_CLR(source_fd, master_set_ptr);
+        *p2p_fd_ptr = -1;
+        *p2p_handshake_complete_ptr = 0;
         break;
 
     case REQ_CHECKALERT: // 36 (SS -> SL)
@@ -622,13 +631,29 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
 
     case MSG_OK: // 0
         printf(">> Lógica para MSG_OK (confirmação genérica) aqui.\n");
+        if (source_fd == *p2p_fd_ptr)
+        {
+            int ok_code = atoi(p1);
+            if (ok_code == OK_SUCCESSFUL_DISCONNECT)
+            {
+                printf("[P2P] Confirmação de desconexão recebida do peer. A fechar a ligação P2P (fd: %d).\n", source_fd);
+                close(source_fd);
+                FD_CLR(source_fd, master_set_ptr);
+                *p2p_fd_ptr = -1;
+                *p2p_handshake_complete_ptr = 0;
+            }
+            else
+            {
+                printf("[P2P] Recebido MSG_OK do peer com código desconhecido: %s\n", p1);
+            }
+        }
         break;
 
     case MSG_ERROR: // 255
         if (source_fd == *p2p_fd_ptr)
         {
             printf("[SS] Recebido MSG_ERROR do SL (peer).\n");
-            // Encontrar o pedido pendente para notificar o cliente original.
+
             int pending_slot = -1;
             for (int i = 0; i < MAX_CLIENTS; i++)
             {
@@ -643,16 +668,14 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
                 int original_client_fd = pending_requests_array[pending_slot].original_client_fd;
                 printf("[SS] A encaminhar o erro para o cliente original (fd: %d).\n", original_client_fd);
 
-                // Constrói uma mensagem de erro para o cliente (pode ser o mesmo erro ou um novo)
-                build_message(send_buffer, sizeof(send_buffer), MSG_ERROR, p1, NULL); // Repassa o código de erro do SL
+                build_message(send_buffer, sizeof(send_buffer), MSG_ERROR, p1, NULL);
                 send(original_client_fd, send_buffer, strlen(send_buffer), 0);
 
-                pending_requests_array[pending_slot].is_active = 0; // Limpa o pedido
+                pending_requests_array[pending_slot].is_active = 0;
             }
         }
         else
         {
-            // Mensagem de erro veio de um cliente, o que é inesperado.
             printf("[SERVER] AVISO: Recebido MSG_ERROR de um cliente (fd: %d). Ignorando.\n", source_fd);
         }
 
@@ -662,6 +685,30 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         printf("[SERVER] Código de mensagem desconhecido (%d) recebido do fd %d. Ignorando.\n", received_code, source_fd);
         break;
     }
+}
+
+void handle_disconnect_request(SensorInfo *sensors_array, char p1[256], char send_buffer[500], int source_fd, int *sensor_count_ptr, fd_set *master_set_ptr)
+{
+
+    SensorInfo *sensor_info = get_sensor_by_id(sensors_array, p1);
+    if (sensor_info == NULL)
+    {
+        fprintf(stderr, "[SERVER] AVISO: REQ_DISCSEN recebido para um sensor não encontrado (ID: %s).\n", p1);
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "11", NULL); // Sensor not found
+        send(source_fd, send_buffer, strlen(send_buffer), 0);
+        return;
+    }
+
+    printf("[SERVER] A enviar confirmação OK para o sensor %s.\n", p1);
+    build_message(send_buffer, MAX_MSG_SIZE, MSG_OK, "1", NULL); // OK_SUCCESSFUL_DISCONNECT
+    send(source_fd, send_buffer, strlen(send_buffer), 0);
+
+    sensor_info->is_active = 0;
+    (*sensor_count_ptr)--;
+    printf("[SERVER] Sensor %s removido do slot (fd: %d).\n", p1, source_fd);
+
+    close(source_fd);
+    FD_CLR(source_fd, master_set_ptr);
 }
 
 void handle_check_alert_request(SensorInfo *sensors_array, char p1[256], int source_fd, char send_buffer[500])
@@ -731,7 +778,7 @@ void handle_check_failure_command(int source_fd, char p1[256], SensorInfo *senso
         else
         {
             printf("[SS] ERRO: Não há espaço para registar o pedido P2P pendente.\n");
-            build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "0", NULL); // Um erro genérico de servidor ocupado
+            build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "0", NULL);
         }
         send(*p2p_fd_ptr, send_buffer, strlen(send_buffer), 0);
 
@@ -847,7 +894,6 @@ void handle_p2p_communication(int current_p2p_comm_fd, int *p2p_comm_fd_main_ptr
         if (*p2p_handshake_complete_ptr == 0 && p2p_bytes_received == 0)
         {
             printf("[P2P DEBUG] recv() retornou 0 durante o handshake. A ignorar por agora para evitar desconexão prematura.\n");
-            return; // Sai da função, mas mantém a conexão aberta.
         }
         else if (p2p_bytes_received == 0)
         {
@@ -889,7 +935,6 @@ void handle_client_communication(int client_socket_fd, fd_set *master_set_ptr,
                                  PendingRequest *pending_requests_array)
 {
     char recv_buffer[MAX_MSG_SIZE];
-    char send_buffer[MAX_MSG_SIZE];
     memset(recv_buffer, 0, MAX_MSG_SIZE);
     ssize_t bytes_received;
 
@@ -940,7 +985,7 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
     char *peer_target_ip = argv[1];
-    int common_p2p_port = atoi(argv[2]); // Esta é a porta P2P comum
+    int common_p2p_port = atoi(argv[2]);
     int client_listen_port = atoi(argv[3]);
     // end args validation
 
@@ -1020,6 +1065,8 @@ int main(int argc, char *argv[])
     FD_ZERO(&read_fds);
 
     FD_SET(listen_fd, &master_set);
+    FD_SET(STDIN_FILENO, &master_set);
+
     fd_max = listen_fd;
 
     initialize_p2p_link(peer_target_ip, common_p2p_port,
@@ -1065,6 +1112,45 @@ int main(int argc, char *argv[])
             // When the loop reaches here, it means that listen_fd
             // that is the main socket for clients
             // is receiving a new connection
+
+            if (i == STDIN_FILENO)
+            {
+                char command_buffer[MAX_MSG_SIZE];
+                if (fgets(command_buffer, sizeof(command_buffer), stdin) == NULL)
+                {
+                    // EOF (Ctrl+D) detectado, pode decidir encerrar o servidor aqui se desejar.
+                    printf("[SERVER] EOF detectado no teclado. A ignorar.\n");
+                    continue; // Continua o loop
+                }
+
+                // Remove a nova linha do final
+                command_buffer[strcspn(command_buffer, "\n")] = 0;
+
+                if (strcmp(command_buffer, "close connection") == 0)
+                {
+                    if (p2p_fd != -1)
+                    {
+                        printf("[SERVER] A iniciar o encerramento da ligação P2P...\n");
+                        // Envia o pedido de desconexão para o peer
+                        char send_buffer[MAX_MSG_SIZE];
+                        // O PDF especifica um payload PidS, mas como ainda não o estamos a gerir,
+                        // enviamos sem payload por agora.
+                        build_message(send_buffer, MAX_MSG_SIZE, REQ_DISCPEER, NULL, NULL);
+                        send(p2p_fd, send_buffer, strlen(send_buffer), 0);
+
+                        // A lógica de fechar o socket do nosso lado virá depois de receber a confirmação.
+                    }
+                    else
+                    {
+                        printf("[SERVER] Nenhum peer conectado para encerrar a ligação.\n");
+                    }
+                }
+                else
+                {
+                    printf("[SERVER] Comando desconhecido: \"%s\"\n", command_buffer);
+                }
+                continue; // Continua o loop para verificar outros sockets
+            }
             if (i == listen_fd)
             {
                 handle_new_client_connection(listen_fd, &master_set, &fd_max);
