@@ -10,16 +10,31 @@
 #include "common.h"
 #include <stddef.h>
 
-// SOCKET_ERROR is -1 because is the value returned by socket() and accept() when they fail
-#define SOCKET_ERROR -1
-
 typedef enum
 {
-    PARSE_ERROR_INVALID_FORMAT = -1,
-    PARSE_SUCCESS_CODE_ONLY = 1,   // Only the code was read
-    PARSE_SUCCESS_ONE_PAYLOAD = 2, // Code and payload1 were read
-    PARSE_SUCCESS_TWO_PAYLOADS = 3 // Code, payload1 and payload2 were read
-} ParseResultType;
+    ROLE_STATUS_SERVER,
+    ROLE_LOCATION_SERVER
+} ServerRole;
+
+// Global state that indicate the role of the server (SS or SL)
+ServerRole my_role;
+
+SensorInfo *get_sensor_by_socket_fd(SensorInfo *sensors_array, int sensor_count, int socket_fd)
+{
+    for (int i = 0; i < sensor_count; i++)
+        if (sensors_array[i].socket_fd == socket_fd)
+            return &sensors_array[i];
+    return NULL;
+}
+
+SensorInfo *get_sensor_by_id(SensorInfo *sensors_array, const char *sensor_id)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (sensors_array[i].is_active && strcmp(sensors_array[i].sensor_id_str, sensor_id) == 0)
+            return &sensors_array[i];
+
+    return NULL;
+}
 
 // Auxiliary function to handle errors and exit the program
 // This function prints the error message and exits the program with EXIT_FAILURE
@@ -265,6 +280,11 @@ void initialize_p2p_link(const char *peer_target_ip, int common_p2p_port,
             *fd_max_ptr = *p2p_fd_ptr;
         }
         printf("Conectado com sucesso ao servidor peer (fd: %d).\n", *p2p_fd_ptr);
+
+        char send_buffer[MAX_MSG_SIZE];
+        build_message(send_buffer, MAX_MSG_SIZE, REQ_CONNPEER, NULL, NULL);
+        printf("[P2P] A enviar REQ_CONNPEER para o peer (fd: %d)\n", *p2p_fd_ptr);
+        send(*p2p_fd_ptr, send_buffer, strlen(send_buffer), 0);
         return;
     }
 
@@ -405,6 +425,367 @@ void handle_incoming_p2p_connection(int current_p2p_listen_fd, int *p2p_comm_fd_
     }
 }
 
+void register_new_sensor(SensorInfo *sensors_array, int source_fd, char p1[256], long long *next_sensor_id_ptr, int *sensor_count_ptr, char send_buffer[500]);
+
+void handle_error_adding_more_than_max_clients(int source_fd, char send_buffer[500], fd_set *master_set_ptr);
+
+void handle_diagnose_command(char p2[256], SensorInfo *sensors_array, int source_fd, char send_buffer[500]);
+
+void handle_check_failure_command(int source_fd, char p1[256], SensorInfo *sensors_array, char send_buffer[500], int *p2p_fd_ptr, PendingRequest *pending_requests_array);
+
+void handle_check_alert_request(SensorInfo *sensors_array, char p1[256], int source_fd, char send_buffer[500]);
+
+void handle_check_alert_response(int source_fd, const char *location_payload,
+                                 SensorInfo *sensors_array, char *send_buffer,
+                                 PendingRequest *pending_requests_array)
+{
+    printf("[SS] Recebido RES_CHECKALERT do SL com a localização: %s\n", location_payload);
+
+    int pending_slot = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (pending_requests_array[i].is_active)
+        {
+            pending_slot = i;
+            break;
+        }
+
+    if (pending_slot != -1)
+    {
+        // Encontrámos um pedido pendente. Vamos assumir que é este.
+        int original_client_fd = pending_requests_array[pending_slot].original_client_fd;
+        printf("[SS] A encaminhar a localização para o cliente original (fd: %d).\n", original_client_fd);
+
+        // Constrói a mensagem final RES_SENSSTATUS (código 41) para o cliente,
+        // usando o payload de localização que recebemos do SL.
+        build_message(send_buffer, MAX_MSG_SIZE, RES_SENSSTATUS, location_payload, NULL);
+        send(original_client_fd, send_buffer, strlen(send_buffer), 0);
+
+        // Limpa o pedido pendente, pois ele foi concluído.
+        pending_requests_array[pending_slot].is_active = 0;
+        printf("[SS] Pedido pendente no slot %d foi concluído e limpo.\n", pending_slot);
+    }
+    else
+    {
+        // Recebemos uma resposta do SL mas não tínhamos nenhum pedido pendente registado.
+        fprintf(stderr, "[SS] AVISO: Recebido RES_CHECKALERT mas não há pedidos pendentes registados.\n");
+    }
+}
+
+/**
+ * @brief Processa qualquer mensagem recebida, seja de um cliente ou de um peer.
+ * Esta função age como o cérebro do protocolo do servidor.
+ * * @param source_fd O socket de onde a mensagem se originou.
+ * @param received_buffer A string de mensagem bruta recebida.
+ * @param server_state Ponteiros e variáveis que representam o estado atual do servidor.
+ * (Esta parte será mais formalizada no futuro com uma struct de estado)
+ */
+void process_incoming_message(int source_fd, const char *received_buffer,
+                              fd_set *master_set_ptr, int *p2p_fd_ptr,
+                              SensorInfo *sensors_array, int *sensor_count_ptr,
+                              long long *next_sensor_id_ptr, PendingRequest *pending_requests_array)
+{
+    int received_code;
+    char p1[256], p2[256];
+    char send_buffer[MAX_MSG_SIZE];
+
+    // 1. Analisa a mensagem para obter o código e os payloads
+    ParseResultType result = parse_message(received_buffer, &received_code, p1, p2);
+
+    if (result == PARSE_ERROR_INVALID_FORMAT)
+    {
+        fprintf(stderr, "[SERVER] Formato de mensagem inválido do fd %d: \"%s\". Ignorando.\n", source_fd, received_buffer);
+        return;
+    }
+
+    // 2. Processa a mensagem com base no código
+    printf("[SERVER] Processando código %d do fd %d.\n", received_code, source_fd);
+    switch (received_code)
+    {
+        // --- Mensagens de Controle (Cliente -> Servidor) ---
+    case REQ_CONNSEN: // Código 23
+        printf("[SERVER] Recebido REQ_CONNSEN do fd %d com LocId=%s\n", source_fd, p1);
+        if (*sensor_count_ptr >= MAX_CLIENTS)
+            handle_error_adding_more_than_max_clients(source_fd, send_buffer, master_set_ptr);
+        else
+            register_new_sensor(sensors_array, source_fd, p1, next_sensor_id_ptr, sensor_count_ptr, send_buffer);
+        break;
+
+    case REQ_DISCSEN: // 25
+        printf(">> Lógica para REQ_DISCSEN (desconectar sensor) aqui.\n");
+        break;
+
+    // --- Mensagens de Dados (Cliente -> Servidor) ---
+    case REQ_SENSLOC: // 38 (para Servidor de Localização)
+        if (my_role != ROLE_LOCATION_SERVER)
+        {
+            fprintf(stderr, "[SERVER] REQ_SENSLOC recebido em um servidor que não é o Servidor de Localização. Ignorando.\n");
+            break;
+        }
+        printf(">> Lógica para REQ_SENSLOC (locate sensor) aqui.\n");
+        SensorInfo *sensor = get_sensor_by_id(sensors_array, p1);
+        if (sensor != NULL)
+        {
+            char location_str[5];
+            snprintf(location_str, sizeof(location_str), "%d", sensor->location_id);
+            build_message(send_buffer, MAX_MSG_SIZE, RES_SENSLOC, sensor->sensor_id_str, location_str);
+        }
+        else
+            build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", NULL);
+
+        send(source_fd, send_buffer, strlen(send_buffer), 0);
+        break;
+
+    // --- NOVO: Bloco unificado para o código 40 ---
+    case 40: // Código compartilhado para REQ_SENSSTATUS e REQ_LOCLIST
+        if (my_role == ROLE_STATUS_SERVER)
+        {
+            printf(">> Lógica para REQ_SENSSTATUS (check failure) aqui.\n");
+            // Mensagem com 1 payload só pode ser REQ_SENSSTATUS
+            handle_check_failure_command(source_fd, p1, sensors_array, send_buffer, p2p_fd_ptr, pending_requests_array);
+        }
+        else if (my_role == ROLE_LOCATION_SERVER)
+        {
+            printf("[SL] Recebido REQ_LOCLIST do sensor %s para a localização %s\n", p1, p2);
+
+            handle_diagnose_command(p2, sensors_array, source_fd, send_buffer);
+        }
+        else
+        {
+            fprintf(stderr, "[SERVER] Recebido código 40 com número inesperado de payloads. Ignorando.\n");
+        }
+        break;
+
+    // --- Mensagens de Controle (Peer -> Peer) ---
+    case REQ_CONNPEER: // 20
+        printf("[P2P] Recebido REQ_CONNPEER do peer (fd: %d).\n", source_fd);
+
+        // Conforme o PDF, o servidor define um ID para o peer e responde.
+        // Por agora, vamos usar um ID estático para o teste.
+        const char *peer_id_para_resposta = "PEER_ID_1";
+
+        printf("[P2P] A responder com RES_CONNPEER para o peer (fd: %d)\n", source_fd);
+        build_message(send_buffer, MAX_MSG_SIZE, RES_CONNPEER, peer_id_para_resposta, NULL);
+        send(source_fd, send_buffer, strlen(send_buffer), 0);
+        break;
+
+    case RES_CONNPEER: // 21
+        printf(">> Lógica para RES_CONNPEER (resposta de conexão P2P) aqui.\n");
+        break;
+
+    case REQ_DISCPEER: // 22
+        printf(">> Lógica para REQ_DISCPEER (pedido de desconexão P2P) aqui.\n");
+        break;
+
+    // --- Mensagens de Dados (Peer -> Peer) ---
+    case REQ_CHECKALERT: // 36 (SS -> SL)
+        if (my_role != ROLE_LOCATION_SERVER)
+        {
+            fprintf(stderr, "[SERVER] REQ_CHECKALERT recebido em um servidor que não é o Servidor de Localização. Ignorando.\n");
+            break;
+        }
+        printf("[SL] Recebido REQ_CHECKALERT do peer para o sensor ID %s\n", p1);
+
+        handle_check_alert_request(sensors_array, p1, source_fd, send_buffer);
+
+        break;
+
+    case RES_CHECKALERT: // 37 (SL -> SS)
+        if (my_role == ROLE_STATUS_SERVER)
+            handle_check_alert_response(source_fd, p1, sensors_array, send_buffer, pending_requests_array);
+        else
+            fprintf(stderr, "[SL] ERRO: Recebido RES_CHECKALERT, mas este servidor não é um SS.\n");
+        break;
+
+    // --- Mensagens Genéricas de Resposta (Servidor -> Cliente ou Peer) ---
+    // Estes códigos geralmente não são recebidos pelo servidor, mas sim enviados.
+    // O fall-through é a maneira correta de lidar com códigos de resposta duplicados.
+    case RES_CONNSEN: // 24
+    case RES_SENSLOC: // 39
+    case 41:          // Código compartilhado para RES_SENSSTATUS e RES_LOCLIST
+        printf(">> AVISO: Recebido código de resposta do servidor (%d) do fd %d. Inesperado.\n", received_code, source_fd);
+        break;
+
+    case MSG_OK: // 0
+        printf(">> Lógica para MSG_OK (confirmação genérica) aqui.\n");
+        break;
+
+    case MSG_ERROR: // 255
+        printf(">> Lógica para MSG_ERROR (mensagem de erro genérica) aqui.\n");
+        break;
+
+    default:
+        printf("[SERVER] Código de mensagem desconhecido (%d) recebido do fd %d. Ignorando.\n", received_code, source_fd);
+        break;
+    }
+}
+
+void handle_check_alert_request(SensorInfo *sensors_array, char p1[256], int source_fd, char send_buffer[500])
+{
+    SensorInfo *found_sensor = get_sensor_by_id(sensors_array, p1);
+
+    if (found_sensor != NULL)
+    {
+        char location_str[5];
+        snprintf(location_str, sizeof(location_str), "%d", found_sensor->location_id);
+
+        printf("[SL] Localização do sensor %s é %s. A enviar RES_CHECKALERT para o SS (fd: %d).\n",
+               p1, location_str, source_fd);
+
+        build_message(send_buffer, MAX_MSG_SIZE, RES_CHECKALERT, location_str, NULL);
+    }
+    else
+    {
+        printf("[SL] Sensor ID %s não encontrado no SL. A enviar erro para o SS.\n", p1);
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", NULL);
+    }
+    send(source_fd, send_buffer, strlen(send_buffer), 0);
+}
+
+void handle_check_failure_command(int source_fd, char p1[256], SensorInfo *sensors_array, char send_buffer[500], int *p2p_fd_ptr, PendingRequest *pending_requests_array)
+{
+
+    printf("[SS] Recebido REQ_SENSSTATUS do fd %d para o sensor ID %s\n", source_fd, p1);
+
+    SensorInfo *found_sensor = get_sensor_by_id(sensors_array, p1);
+
+    if (found_sensor == NULL)
+    {
+        printf("[SS] Sensor ID %s não encontrado. A enviar erro para fd %d.\n", p1, source_fd);
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", NULL);
+        send(source_fd, send_buffer, strlen(send_buffer), 0);
+        return;
+    }
+
+    printf("[SS] Status do sensor %s é %d.\n", p1, found_sensor->risk_status);
+
+    if (found_sensor->risk_status == 1 && p2p_fd_ptr != NULL && *p2p_fd_ptr != -1)
+    {
+
+        printf("[SS] Risco detectado. A enviar REQ_CHECKALERT para o Servidor de Localização (SL)...\n");
+        // O SS envia para o SL para obter a localização do sensor
+        build_message(send_buffer, MAX_MSG_SIZE, REQ_CHECKALERT, p1, NULL);
+        send(*p2p_fd_ptr, send_buffer, strlen(send_buffer), 0);
+
+        // IMPORTANTE: O servidor SS agora precisa de esperar pela resposta RES_CHECKALERT do SL.
+        int pending_slot = -1;
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (pending_requests_array[i].is_active == 0)
+            {
+                pending_slot = i;
+                break;
+            }
+
+        if (pending_slot != -1)
+        {
+            // Encontrámos um espaço livre. Registamos o pedido.
+            pending_requests_array[pending_slot].is_active = 1;
+            pending_requests_array[pending_slot].original_client_fd = source_fd;
+            strncpy(pending_requests_array[pending_slot].sensor_id_in_query, p1, sizeof(pending_requests_array[pending_slot].sensor_id_in_query) - 1);
+
+            printf("[SS] Pedido pendente registado no slot %d para o cliente fd %d.\n", pending_slot, source_fd);
+
+            // Agora, envia o pedido para o peer (SL)
+            printf("[SS] A enviar REQ_CHECKALERT para o Servidor de Localização (SL)...\n");
+            build_message(send_buffer, MAX_MSG_SIZE, REQ_CHECKALERT, p1, NULL);
+        }
+        else
+        {
+            // Não há espaço para registar o pedido pendente.
+            printf("[SS] ERRO: Não há espaço para registar o pedido P2P pendente.\n");
+            build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "0", NULL); // Um erro genérico de servidor ocupado
+        }
+        send(*p2p_fd_ptr, send_buffer, strlen(send_buffer), 0);
+
+        return;
+    }
+
+    printf("[SS] Risco detectado, mas não há conexão P2P com o SL para verificar a localização.\n");
+    build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "2", NULL);
+    send(source_fd, send_buffer, strlen(send_buffer), 0);
+}
+
+void handle_diagnose_command(char p2[256], SensorInfo *sensors_array, int source_fd, char send_buffer[500])
+{
+    // String payload that will hold the list of sensors in the specified location
+    char sensor_list_payload[MAX_MSG_SIZE - 10] = "";
+
+    int target_loc = atoi(p2);
+    int found_count = 0;
+
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (sensors_array[i].is_active && sensors_array[i].location_id == target_loc)
+        {
+            if (found_count > 0)
+                strncat(sensor_list_payload, ",", sizeof(sensor_list_payload) - strlen(sensor_list_payload) - 1);
+
+            strncat(sensor_list_payload, sensors_array[i].sensor_id_str, sizeof(sensor_list_payload) - strlen(sensor_list_payload) - 1);
+            found_count++;
+        }
+    }
+
+    if (found_count > 0)
+    {
+        printf("[SL] Sensores encontrados em %d: %s. Enviando resposta para fd %d.\n", target_loc, sensor_list_payload, source_fd);
+        build_message(send_buffer, MAX_MSG_SIZE, RES_LOCLIST, sensor_list_payload, NULL);
+    }
+    else
+    {
+        printf("[SL] Nenhum sensor encontrado na localização %d. Enviando erro para fd %d.\n", target_loc, source_fd);
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", NULL);
+    }
+    send(source_fd, send_buffer, strlen(send_buffer), 0);
+}
+
+void handle_error_adding_more_than_max_clients(int source_fd, char send_buffer[500], fd_set *master_set_ptr)
+{
+    printf("[SERVER] Limite de sensores atingido. Rejeitando fd %d.\n", source_fd);
+    build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "9", NULL); // ERR_SENSOR_LIMIT_EXCEEDED = 9
+    send(source_fd, send_buffer, strlen(send_buffer), 0);
+    // Fecha a conexão com este cliente que não pode ser servido
+    close(source_fd);
+    FD_CLR(source_fd, master_set_ptr);
+}
+
+void register_new_sensor(SensorInfo *sensors_array, int source_fd, char p1[256], long long *next_sensor_id_ptr, int *sensor_count_ptr, char send_buffer[500])
+{
+    // Try to find a empty slot in the sensors_array
+    int slot_index = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (sensors_array[i].is_active == 0)
+        {
+            slot_index = i;
+            break;
+        }
+    }
+
+    if (slot_index != -1)
+    {
+
+        sensors_array[slot_index].is_active = 1;
+        sensors_array[slot_index].socket_fd = source_fd;
+        sensors_array[slot_index].location_id = atoi(p1);
+        sensors_array[slot_index].risk_status = (slot_index % 3 == 0) ? 1 : 0;
+
+        // Generate a new sensor ID and store it as a string
+        snprintf(sensors_array[slot_index].sensor_id_str, 20, "%lld", *next_sensor_id_ptr);
+        (*next_sensor_id_ptr)++;
+        (*sensor_count_ptr)++;
+
+        printf("[SERVER] Cliente (fd: %d) registrado com sucesso. Novo ID: %s, Loc: %d, Status de Risco: %d\n",
+               source_fd, sensors_array[slot_index].sensor_id_str, sensors_array[slot_index].location_id, sensors_array[slot_index].risk_status);
+
+        build_message(send_buffer, MAX_MSG_SIZE, RES_CONNSEN, sensors_array[slot_index].sensor_id_str, NULL);
+        send(source_fd, send_buffer, strlen(send_buffer), 0);
+    }
+    // WANING: THIS SHOULD NEVER HAPPEN
+    else
+    {
+        fprintf(stderr, "[SERVER] ERRO CRÍTICO: sensor_count está dessincronizado com o array de sensores.\n");
+    }
+}
+
 /**
  * @brief Processes data received or disconnection on an established P2P communication socket.
  *
@@ -442,6 +823,9 @@ void handle_p2p_communication(int current_p2p_comm_fd, int *p2p_comm_fd_main_ptr
     // If we reach here, it means that we successfully received data from the P2P communication socket
     p2p_buffer[p2p_bytes_received] = '\0';
     printf("Recebido do peer (fd %d): '%s'\n", current_p2p_comm_fd, p2p_buffer);
+    process_incoming_message(current_p2p_comm_fd, p2p_buffer,
+                             master_set_ptr, p2p_comm_fd_main_ptr,
+                             NULL, NULL, NULL, NULL);
 }
 
 /**
@@ -449,14 +833,19 @@ void handle_p2p_communication(int current_p2p_comm_fd, int *p2p_comm_fd_main_ptr
  *
  * @param client_socket_fd The client socket that had activity.
  * @param master_set_ptr Pointer to the master set of FDs.
+ * @param sensors_array Pointer to the array of connected sensors.
+ * @param sensor_count_ptr Pointer to the current number of connected sensors.
+ * @param next_sensor_id_ptr Pointer to the next sensor ID value.
  */
-void handle_client_communication(int client_socket_fd, fd_set *master_set_ptr)
+void handle_client_communication(int client_socket_fd, fd_set *master_set_ptr,
+                                 SensorInfo *sensors_array, int *sensor_count_ptr, long long *next_sensor_id_ptr)
 {
-    char buffer[MAX_MSG_SIZE];
-    memset(buffer, 0, MAX_MSG_SIZE);
+    char recv_buffer[MAX_MSG_SIZE];
+    char send_buffer[MAX_MSG_SIZE];
+    memset(recv_buffer, 0, MAX_MSG_SIZE);
     ssize_t bytes_received;
 
-    if ((bytes_received = recv(client_socket_fd, buffer, MAX_MSG_SIZE - 1, 0)) <= 0)
+    if ((bytes_received = recv(client_socket_fd, recv_buffer, MAX_MSG_SIZE - 1, 0)) <= 0)
     {
         if (bytes_received == 0)
         {
@@ -468,31 +857,31 @@ void handle_client_communication(int client_socket_fd, fd_set *master_set_ptr)
         }
 
         // Close the client socket and remove it from the master set
+        SensorInfo *sensor_to_close = get_sensor_by_socket_fd(sensors_array, *sensor_count_ptr, client_socket_fd);
+        sensor_to_close->is_active = 0;
+        (*sensor_count_ptr)--;
         close(client_socket_fd);
         FD_CLR(client_socket_fd, master_set_ptr);
         return;
     }
 
     // If we reach here, it means that we successfully received data from the client socket
-    buffer[bytes_received] = '\0';
-    printf("Recebido do cliente (fd %d): %s\n", client_socket_fd, buffer);
+    recv_buffer[bytes_received] = '\0';
+    printf("Recebido do cliente (fd %d): %s\n", client_socket_fd, recv_buffer);
 
-    // Simple answer generated by AI for tests
-    char reply_msg[MAX_MSG_SIZE + 60];
-    snprintf(reply_msg, sizeof(reply_msg), "Servidor: Msg recebida do cliente %d: '%s'", client_socket_fd, buffer);
+    int received_code;
+    char p1[256], p2[256];
+    ParseResultType result = parse_message(recv_buffer, &received_code, p1, p2);
 
-    ssize_t bytes_sent = send(client_socket_fd, reply_msg, strlen(reply_msg), 0);
-    if (bytes_sent == SOCKET_ERROR)
+    if (result == PARSE_ERROR_INVALID_FORMAT)
     {
-        perror("Erro ao enviar resposta ao cliente");
-        // Considere fechar este cliente se o send falhar
-        close(client_socket_fd);
-        FD_CLR(client_socket_fd, master_set_ptr);
+        fprintf(stderr, "Formato de mensagem inválido do cliente (fd: %d). Ignorando.\n", client_socket_fd);
+        return;
     }
-    else
-    {
-        printf("Resposta enviada ao cliente (fd %d): '%s'\n", client_socket_fd, reply_msg);
-    }
+
+    process_incoming_message(client_socket_fd, recv_buffer,
+                             master_set_ptr, NULL, // P2P não é usado aqui
+                             sensors_array, sensor_count_ptr, next_sensor_id_ptr, NULL);
 }
 
 int main(int argc, char *argv[])
@@ -507,6 +896,33 @@ int main(int argc, char *argv[])
     int common_p2p_port = atoi(argv[2]); // Esta é a porta P2P comum
     int client_listen_port = atoi(argv[3]);
     // end args validation
+
+    // Server function
+
+    if (client_listen_port == 60000)
+    {
+        my_role = ROLE_LOCATION_SERVER;
+        printf("Servidor a iniciar no papel de: Servidor de Localização (SL) na porta %d\n", client_listen_port);
+    }
+    else if (client_listen_port == 61000)
+    {
+        my_role = ROLE_STATUS_SERVER;
+        printf("Servidor a iniciar no papel de: Servidor de Status (SS) na porta %d\n", client_listen_port);
+    }
+    // end server function
+
+    // start of the sensors configuration
+    SensorInfo connected_sensors[MAX_CLIENTS];
+    PendingRequest pending_requests[MAX_CLIENTS];
+    int sensor_count = 0;
+    static long long next_sensor_id_numeric = 1000000001L;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        connected_sensors[i].is_active = 0;
+        connected_sensors[i].socket_fd = -1;
+        pending_requests[i].is_active = 0;
+    }
+    // end of the sensors configuration
 
     // P2P configuration
 
@@ -621,7 +1037,7 @@ int main(int argc, char *argv[])
             // That indicate that the client is just sedind data or disconnecting
             else
             {
-                handle_client_communication(i, &master_set);
+                handle_client_communication(i, &master_set, connected_sensors, &sensor_count, &next_sensor_id_numeric);
             }
         }
     }
