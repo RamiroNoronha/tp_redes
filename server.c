@@ -379,7 +379,7 @@ void handle_incoming_p2p_connection(int current_p2p_listen_fd, int *p2p_comm_fd_
         printf("[SERVER] P2P limit is one\n");
 
         char send_buffer[MAX_MSG_SIZE];
-        build_message(send_buffer, sizeof(send_buffer), MSG_ERROR, "1", NULL);
+        build_message(send_buffer, sizeof(send_buffer), MSG_ERROR, "1", "Peer limit exceeded");
         send(accepted_p2p_comm_fd, send_buffer, strlen(send_buffer), 0);
         close(accepted_p2p_comm_fd);
     }
@@ -590,7 +590,7 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
             {
                 int original_client_fd = pending_requests_array[pending_slot].original_client_fd;
                 printf("[SS] A encaminhar o erro para o cliente original (fd: %d).\n", original_client_fd);
-
+                // TODO: see the correct error message e code
                 build_message(send_buffer, sizeof(send_buffer), MSG_ERROR, p1, NULL);
                 send(original_client_fd, send_buffer, strlen(send_buffer), 0);
 
@@ -666,7 +666,7 @@ void handle_check_alert_request(SensorInfo *sensors_array, char p1[256], int sou
     else
     {
         printf("[SL] Sensor %s not found\n", p1);
-        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", NULL);
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", "Sensor not found");
     }
     send(source_fd, send_buffer, strlen(send_buffer), 0);
 }
@@ -681,14 +681,14 @@ void handle_check_failure_command(int source_fd, char p1[256], SensorInfo *senso
 
     if (found_sensor == NULL)
     {
-        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", NULL);
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", "Sensor not found");
         send(source_fd, send_buffer, strlen(send_buffer), 0);
         return;
     }
 
     if (found_sensor->is_active == 0)
     {
-        build_message(send_buffer, MAX_MSG_SIZE, MSG_OK, "03", NULL);
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_OK, "03", "Status do sensor 0");
         send(source_fd, send_buffer, strlen(send_buffer), 0);
         return;
     }
@@ -717,14 +717,15 @@ void handle_check_failure_command(int source_fd, char p1[256], SensorInfo *senso
         }
         else
         {
+            // TODO: see the correct error message e code
             build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "0", NULL);
         }
         send(*p2p_fd_ptr, send_buffer, strlen(send_buffer), 0);
 
         return;
     }
-
-    build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "2", NULL);
+    // TODO: see the correct error message e code
+    build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "2", "Peer not found");
     send(source_fd, send_buffer, strlen(send_buffer), 0);
 }
 
@@ -758,7 +759,7 @@ void handle_diagnose_command(char p2[256], SensorInfo *sensors_array, int source
     else
     {
         printf("[SL] Location not found\n");
-        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", NULL);
+        build_message(send_buffer, MAX_MSG_SIZE, MSG_ERROR, "10", "Sensor not found");
     }
     send(source_fd, send_buffer, strlen(send_buffer), 0);
 }
