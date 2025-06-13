@@ -7,11 +7,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <time.h>
 #include "common.h"
 
 typedef struct
 {
-    // File Descriptors
     int sl_fd;
     int ss_fd;
 
@@ -112,7 +112,8 @@ const char *get_region_name(int loc_id)
         return "Leste";
     if (loc_id >= 8 && loc_id <= 10)
         return "Oeste";
-    return "Região Desconhecida";
+    return "Outside covered zone";
+    ;
 }
 
 void process_keyboard_input(SensorState *state)
@@ -135,34 +136,25 @@ void process_keyboard_input(SensorState *state)
     if (!command)
         return;
 
-    if (strcmp(command, "close") == 0)
+    if (strcmp(command, "kill") == 0)
     {
-        char *arg = strtok(NULL, "");
-        if (arg && strcmp(arg, "connection") == 0)
-        {
-            printf("[CLIENT] A enviar pedidos de desconexão...\n");
-            build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->sl_sensor_id, NULL);
-            send(state->sl_fd, state->send_buffer, strlen(state->send_buffer), 0);
-            build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->ss_sensor_id, NULL);
-            send(state->ss_fd, state->send_buffer, strlen(state->send_buffer), 0);
-        }
-        else
-        {
-            printf("[CLIENT] Uso: 'close connection'\n");
-        }
+
+        printf("[CLIENT] kill\n");
+        printf("[CLIENT] Sending REQ_DISCSEN %s\n", state->ss_sensor_id);
+        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->sl_sensor_id, NULL);
+        send(state->sl_fd, state->send_buffer, strlen(state->send_buffer), 0);
+        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->ss_sensor_id, NULL);
+        send(state->ss_fd, state->send_buffer, strlen(state->send_buffer), 0);
     }
     else if (strcmp(command, "check") == 0)
     {
         char *arg = strtok(NULL, "");
         if (arg && strcmp(arg, "failure") == 0)
         {
-            printf("[CLIENT] A enviar REQ_SENSSTATUS para o SS...\n");
+            printf("[CLIENT] check failure\n");
+            printf("[CLIENT] Sending REQ_SENSSTATUS %s\n", state->ss_sensor_id);
             build_message(state->send_buffer, sizeof(state->send_buffer), REQ_SENSSTATUS, state->ss_sensor_id, NULL);
             send(state->ss_fd, state->send_buffer, strlen(state->send_buffer), 0);
-        }
-        else
-        {
-            printf("[CLIENT] Uso: 'check failure'\n");
         }
     }
     else if (strcmp(command, "locate") == 0)
@@ -170,13 +162,11 @@ void process_keyboard_input(SensorState *state)
         char *target_id = strtok(NULL, " ");
         if (target_id)
         {
-            printf("[CLIENT] A solicitar localização do sensor %s para o SL...\n", target_id);
+            printf("[CLIENT] located %s\n", target_id);
+            printf("[CLIENT] Sending REQ_SENSLOC %s\n", target_id);
+
             build_message(state->send_buffer, sizeof(state->send_buffer), REQ_SENSLOC, target_id, NULL);
             send(state->sl_fd, state->send_buffer, strlen(state->send_buffer), 0);
-        }
-        else
-        {
-            printf("[CLIENT] Uso: 'locate <SensID>'\n");
         }
     }
     else if (strcmp(command, "diagnose") == 0)
@@ -184,18 +174,15 @@ void process_keyboard_input(SensorState *state)
         char *target_loc = strtok(NULL, " ");
         if (target_loc)
         {
-            printf("[CLIENT] A solicitar diagnóstico da localização %s para o SL...\n", target_loc);
+            printf("[CLIENT] diagnose %s\n", target_loc);
+            printf("[CLIENT] Sending REQ_LOCLIST %s\n", target_loc);
             build_message(state->send_buffer, sizeof(state->send_buffer), REQ_LOCLIST, state->sl_sensor_id, target_loc);
             send(state->sl_fd, state->send_buffer, strlen(state->send_buffer), 0);
-        }
-        else
-        {
-            printf("[CLIENT] Uso: 'diagnose <LocId>'\n");
         }
     }
     else
     {
-        printf("[CLIENT] Comando desconhecido: '%s'\n", command);
+        printf("[CLIENT] Command not found: '%s'\n", command);
     }
 }
 
@@ -204,7 +191,6 @@ void process_server_message(int server_fd, SensorState *state)
     ssize_t bytes = recv(server_fd, state->recv_buffer, sizeof(state->recv_buffer) - 1, 0);
     if (bytes <= 0)
     {
-        printf("\n[CLIENT] Servidor (fd: %d) desconectou. Encerrando.\n", server_fd);
         if (server_fd == state->sl_fd)
             state->sl_fd = -1;
         if (server_fd == state->ss_fd)
@@ -212,7 +198,6 @@ void process_server_message(int server_fd, SensorState *state)
         return;
     }
     state->recv_buffer[bytes] = '\0';
-    printf("\n[CLIENT] Mensagem de (fd: %d): \"%s\"\n", server_fd, state->recv_buffer);
 
     int code;
     char p1[256], p2[256];
@@ -225,64 +210,77 @@ void process_server_message(int server_fd, SensorState *state)
         {
             strncpy(state->sl_sensor_id, p1, sizeof(state->sl_sensor_id) - 1);
             state->registered_on_sl = 1;
-            printf(">> Registado no SL com ID: %s\n", state->sl_sensor_id);
+            printf("[CLIENTE] SS New ID:: %s\n", state->sl_sensor_id);
         }
         else if (server_fd == state->ss_fd)
         {
             strncpy(state->ss_sensor_id, p1, sizeof(state->ss_sensor_id) - 1);
             state->registered_on_ss = 1;
-            printf(">> Registado no SS com ID: %s\n", state->ss_sensor_id);
-        }
-        if (state->registered_on_sl && state->registered_on_ss)
-        {
-            printf("--------------------------------------------------\n");
-            printf("[CLIENT] Registo completo em ambos os servidores!\n");
-            printf("--------------------------------------------------\n");
+            printf("[CLIENTE] SL New ID:: %s\n", state->ss_sensor_id);
         }
         break;
     case 41: // RES_LOCLIST && RES_SENSSTATUS
-        if (strchr(p1, ','))
+        if (p1[0] != '\0' && p2[0] != '\0')
         {
-            printf(">> Sensores na localização: %s\n", p1);
+            printf("[CLIENT] Sensors at location %s:  %s\n", p1, p2);
         }
         else
         {
             int loc_id = atoi(p1);
-            printf(">> ALERTA DE FALHA! Localização: %d (%s)\n", loc_id, get_region_name(loc_id));
+            printf("[CLIENT] Alert received from area: %d (%s)\n", loc_id, get_region_name(loc_id));
         }
         break;
     case RES_SENSLOC:
-        printf(">> Localização do sensor: %s\n", p1);
+        printf("[CLIENT] Current sensor %s location: %s\n", p1, p2);
         break;
     case MSG_ERROR:
-        printf(">> ERRO recebido do servidor (código: %s)\n", p1);
+        printf("[CLIENT] %s\n", p2);
         break;
     case MSG_OK:
-        printf(">> OK recebido do servidor (código: %s)\n", p1);
+        if (p1[0] == '1')
+        {
+            printf("[CLIENT] Successful disconnect%s\n", p2);
+            if (strcmp(p2, "SS") == 0)
+            {
+                state->ss_fd = -1;
+                state->registered_on_ss = 0;
+            }
+            else if (strcmp(p2, "SL") == 0)
+            {
+                state->sl_fd = -1;
+                state->registered_on_sl = 0;
+            }
+
+            if (state->sl_fd == -1 && state->ss_fd == -1)
+            {
+                printf("[CLIENT] Both connections closed. Exiting...\n");
+                exit(0);
+            }
+        }
+        printf("[CLIENT] %s\n", p2);
         break;
     default:
-        printf(">> Código de mensagem não tratado: %d\n", code);
+        printf("[CLIENT] Code not founded: %d\n", code);
         break;
     }
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc < 5)
+    if (argc < 4)
     {
-        fprintf(stderr, "Uso: %s <server_ip> <sl_port> <ss_port> <location_id>\n", argv[0]);
+        fprintf(stderr, "Uso: %s <server_ip> <sl_port> <ss_port>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
     char *server_ip = argv[1];
     int sl_port = atoi(argv[2]);
     int ss_port = atoi(argv[3]);
-    int location_id = atoi(argv[4]);
 
-    if (location_id < 1 || location_id > 10)
-    {
-        fprintf(stderr, "Argumento inválido: location_id deve estar entre 1 e 10.\n");
-        exit(EXIT_FAILURE);
-    }
+    srand(time(NULL));
+
+    int location_id = (rand() % 11) + 1;
+    if (location_id == 11)
+        location_id = -1;
 
     SensorState state = {0};
 
@@ -290,16 +288,14 @@ int main(int argc, char *argv[])
 
     state.sl_fd = connect_to_server(server_ip, sl_port);
     if (state.sl_fd == SOCKET_ERROR)
-        error_exit("Falha ao conectar ao SL");
-    printf("Conectado ao SL (fd: %d).\n", state.sl_fd);
+        error_exit("Fail to connect to SL");
 
     state.ss_fd = connect_to_server(server_ip, ss_port);
     if (state.ss_fd == SOCKET_ERROR)
     {
         close(state.sl_fd);
-        error_exit("Falha ao conectar ao SS");
+        error_exit("Fail to connect to SS");
     }
-    printf("Conectado ao SS (fd: %d).\n", state.ss_fd);
 
     char location_id_str[4];
     snprintf(location_id_str, sizeof(location_id_str), "%d", location_id);
@@ -358,6 +354,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    printf("\n[CLIENT] Encerrando cliente...\n");
+    printf("\n[CLIENT] Finishing client...\n");
     return 0;
 }
