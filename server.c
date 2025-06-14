@@ -131,7 +131,7 @@ ParseResultType parse_message(const char *buffer_origin, int *destination_code,
     }
 
     // If we reach here, it means that the message format is not recognized
-    fprintf(stderr, "Erro ao analisar mensagem: formato não reconhecido em \"%s\"\n", buffer_origin);
+    fprintf(stderr, "Format error \"%s\"\n", buffer_origin);
     return PARSE_ERROR_INVALID_FORMAT;
 }
 
@@ -401,7 +401,7 @@ void handle_incoming_p2p_connection(int current_p2p_listen_fd, int *p2p_comm_fd_
     }
 }
 
-void register_new_sensor(SensorInfo *sensors_array, int source_fd, char p1[256], long long *next_sensor_id_ptr, int *sensor_count_ptr, char send_buffer[500]);
+void register_new_sensor(SensorInfo *sensors_array, int source_fd, char p1[256], char p2[256], long long *next_sensor_id_ptr, int *sensor_count_ptr, char send_buffer[500]);
 
 void handle_error_adding_more_than_max_clients(int source_fd, char send_buffer[500], fd_set *master_set_ptr);
 
@@ -480,12 +480,10 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         if (*sensor_count_ptr >= MAX_CLIENTS)
             handle_error_adding_more_than_max_clients(source_fd, send_buffer, master_set_ptr);
         else
-            register_new_sensor(sensors_array, source_fd, p1, next_sensor_id_ptr, sensor_count_ptr, send_buffer);
+            register_new_sensor(sensors_array, source_fd, p1, p2, next_sensor_id_ptr, sensor_count_ptr, send_buffer);
         break;
 
     case REQ_DISCSEN: // 25
-        printf("[SERVER] Recebido REQ_DISCSEN do sensor ID %s (fd: %d).\n", p1, source_fd);
-
         handle_disconnect_request(sensors_array, p1, send_buffer, source_fd, sensor_count_ptr, master_set_ptr);
 
         break;
@@ -546,7 +544,6 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         build_message(send_buffer, MAX_MSG_SIZE, MSG_OK, "1", "Peer PEER_ID_1 disconnected");
         send(source_fd, send_buffer, strlen(send_buffer), 0);
 
-        printf("[P2P] A fechar a ligação P2P (fd: %d) do nosso lado.\n", source_fd);
         close(source_fd);
         FD_CLR(source_fd, master_set_ptr);
         *p2p_fd_ptr = -1;
@@ -565,7 +562,6 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
     case RES_CONNSEN: // 24
     case RES_SENSLOC: // 39
     case 41:
-        printf(">> AVISO: Recebido código de resposta do servidor (%d) do fd %d. Inesperado.\n", received_code, source_fd);
         break;
 
     case MSG_OK:
@@ -575,7 +571,7 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
     case MSG_ERROR: // 255
         if (source_fd == *p2p_fd_ptr)
         {
-            printf("[SS] Recebido MSG_ERROR do SL (peer).\n");
+            printf("[SS] MSG_ERROR from SL (peer).\n");
 
             int pending_slot = -1;
             for (int i = 0; i < MAX_CLIENTS; i++)
@@ -589,8 +585,6 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
             if (pending_slot != -1)
             {
                 int original_client_fd = pending_requests_array[pending_slot].original_client_fd;
-                printf("[SS] A encaminhar o erro para o cliente original (fd: %d).\n", original_client_fd);
-                // TODO: see the correct error message e code
                 build_message(send_buffer, sizeof(send_buffer), MSG_ERROR, p1, NULL);
                 send(original_client_fd, send_buffer, strlen(send_buffer), 0);
 
@@ -601,7 +595,7 @@ void process_incoming_message(int source_fd, const char *received_buffer, int *p
         break;
 
     default:
-        printf("[SERVER] Código de mensagem desconhecido (%d) recebido do fd %d. Ignorando.\n", received_code, source_fd);
+        printf("[SERVER] Code not found (%d). Ignore.\n", received_code);
         break;
     }
 }
@@ -686,7 +680,7 @@ void handle_check_failure_command(int source_fd, char p1[256], SensorInfo *senso
         return;
     }
 
-    if (found_sensor->is_active == 0)
+    if (found_sensor->risk_status == 0)
     {
         build_message(send_buffer, MAX_MSG_SIZE, MSG_OK, "03", "Status do sensor 0");
         send(source_fd, send_buffer, strlen(send_buffer), 0);
@@ -774,7 +768,7 @@ void handle_error_adding_more_than_max_clients(int source_fd, char send_buffer[5
     FD_CLR(source_fd, master_set_ptr);
 }
 
-void register_new_sensor(SensorInfo *sensors_array, int source_fd, char p1[256], long long *next_sensor_id_ptr, int *sensor_count_ptr, char send_buffer[500])
+void register_new_sensor(SensorInfo *sensors_array, int source_fd, char p1[256], char p2[256], long long *next_sensor_id_ptr, int *sensor_count_ptr, char send_buffer[500])
 {
     // Try to find a empty slot in the sensors_array
     int slot_index = -1;
@@ -792,13 +786,12 @@ void register_new_sensor(SensorInfo *sensors_array, int source_fd, char p1[256],
 
         sensors_array[slot_index].is_active = 1;
         sensors_array[slot_index].socket_fd = source_fd;
-        sensors_array[slot_index].location_id = atoi(p1);
+        strncpy(sensors_array[slot_index].sensor_id_str, p1, sizeof(sensors_array[slot_index].sensor_id_str) - 1);
+        sensors_array[slot_index].location_id = atoi(p2);
 
         srand(time(NULL));
         sensors_array[slot_index].risk_status = rand() % 2;
 
-        // Generate a new sensor ID and store it as a string
-        snprintf(sensors_array[slot_index].sensor_id_str, 20, "%lld", *next_sensor_id_ptr);
         (*next_sensor_id_ptr)++;
         (*sensor_count_ptr)++;
 
@@ -838,11 +831,11 @@ void handle_p2p_communication(int current_p2p_comm_fd, int *p2p_comm_fd_main_ptr
     {
         if (*p2p_handshake_complete_ptr == 0 && p2p_bytes_received == 0)
         {
-            printf("[P2P DEBUG] recv() retornou 0 durante o handshake. A ignorar por agora para evitar desconexão prematura.\n");
+            printf("[P2P] recv() hand shake problem.\n");
         }
         else if (p2p_bytes_received == 0)
         {
-            printf("Socket P2P (fd %d) desconectou (conexão fechada pelo peer).\n", current_p2p_comm_fd);
+            printf("Socket P2P desconnected.\n");
         }
         else
         {
@@ -1054,7 +1047,7 @@ int main(int argc, char *argv[])
                 // Remove a nova linha do final
                 command_buffer[strcspn(command_buffer, "\n")] = 0;
 
-                if (strcmp(command_buffer, "close connection") == 0)
+                if (strcmp(command_buffer, "kill") == 0)
                 {
                     if (p2p_fd != -1)
                     {

@@ -15,8 +15,7 @@ typedef struct
     int sl_fd;
     int ss_fd;
 
-    char sl_sensor_id[20];
-    char ss_sensor_id[20];
+    char sensor_id[20];
     int registered_on_sl;
     int registered_on_ss;
 
@@ -28,6 +27,131 @@ void error_exit(const char *msg)
 {
     perror(msg);
     exit(EXIT_FAILURE);
+}
+
+/**
+ * @brief Generates a unique 10-digit sensor ID, checking and updating an ID file.
+ * @param id_buffer The buffer where the unique string ID will be stored.
+ * @param buffer_size The size of id_buffer.
+ */
+void generate_unique_sensor_id(char *id_buffer, size_t buffer_size)
+{
+    FILE *fp;
+    char line[256];
+    int is_unique;
+    long long new_id_num;
+    const char *id_filename = "sensor_ids.txt";
+
+    srand(time(NULL) ^ getpid());
+
+    do
+    {
+        is_unique = 1;
+        new_id_num = 1000000000LL + (rand() % 9000000000LL);
+        snprintf(id_buffer, buffer_size, "%lld", new_id_num);
+
+        fp = fopen(id_filename, "r");
+        if (fp != NULL)
+        {
+            while (fgets(line, sizeof(line), fp))
+            {
+                line[strcspn(line, "\n")] = 0;
+                if (strcmp(line, id_buffer) == 0)
+                {
+                    is_unique = 0;
+                    break;
+                }
+            }
+            fclose(fp);
+        }
+    } while (!is_unique);
+
+    fp = fopen(id_filename, "a");
+    if (fp == NULL)
+    {
+        perror("Não foi possível abrir sensor_ids.txt para escrita");
+        return;
+    }
+    fprintf(fp, "%s\n", id_buffer);
+    fclose(fp);
+
+    printf("[ID_GEN] ID único gerado e guardado: %s\n", id_buffer);
+}
+
+/**
+ * @brief Remove uma linha (um ID) do ficheiro sensor_ids.txt.
+ * @param id_to_remove O ID de string a ser removido do ficheiro.
+ */
+void remove_id_from_file(const char *id_to_remove)
+{
+    const char *original_filename = "sensor_ids.txt";
+    const char *temp_filename = "sensor_ids.tmp";
+    FILE *fp_orig, *fp_temp;
+    char line[256];
+
+    fp_orig = fopen(original_filename, "r");
+    fp_temp = fopen(temp_filename, "w");
+
+    if (fp_orig == NULL || fp_temp == NULL)
+    {
+        if (fp_orig)
+            fclose(fp_orig);
+        if (fp_temp)
+            fclose(fp_temp);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), fp_orig))
+    {
+        line[strcspn(line, "\n")] = 0;
+
+        if (strcmp(line, id_to_remove) != 0)
+        {
+            fprintf(fp_temp, "%s\n", line);
+        }
+    }
+
+    fclose(fp_orig);
+    fclose(fp_temp);
+
+    if (remove(original_filename) != 0)
+    {
+        perror("Erro ao apagar o ficheiro de IDs original");
+        return;
+    }
+    if (rename(temp_filename, original_filename) != 0)
+    {
+        perror("Erro ao renomear o ficheiro temporário de IDs");
+        return;
+    }
+}
+
+const char *get_error_message(const char *error_code)
+{
+    if (strcmp(error_code, "01") == 0)
+    {
+        return "Peer limit exceeded";
+    }
+    else if (strcmp(error_code, "02") == 0)
+    {
+        return "Peer not found";
+    }
+    else if (strcmp(error_code, "09") == 0)
+    {
+        return "Sensor limit exceeded";
+    }
+    else if (strcmp(error_code, "10") == 0)
+    {
+        return "Sensor not found";
+    }
+    else if (strcmp(error_code, "11") == 0)
+    {
+        return "Location not found";
+    }
+    else
+    {
+        return "Unknown error";
+    }
 }
 
 int connect_to_server(const char *server_ip, int server_port)
@@ -74,31 +198,41 @@ ParseResultType parse_message(const char *buffer, int *code, char *p1, char *p2)
     char copy[MAX_MSG_SIZE];
     strncpy(copy, buffer, sizeof(copy) - 1);
     copy[sizeof(copy) - 1] = '\0';
+
     if (p1)
         p1[0] = '\0';
     if (p2)
         p2[0] = '\0';
     if (code)
         *code = -1;
+
     char *token, *endptr;
+
     token = strtok(copy, " \t\n\r");
     if (!token)
         return PARSE_ERROR_INVALID_FORMAT;
+
     *code = strtol(token, &endptr, 10);
     if (*endptr != '\0')
         return PARSE_ERROR_INVALID_FORMAT;
+
     token = strtok(NULL, " \t\n\r");
     if (!token)
         return PARSE_SUCCESS_CODE_ONLY;
+
     if (p1)
         strncpy(p1, token, 255);
-    token = strtok(NULL, " \t\n\r");
-    if (!token)
+
+    char *rest = strtok(NULL, "");
+    if (!rest)
         return PARSE_SUCCESS_ONE_PAYLOAD;
+
+    while (*rest && (*rest == ' ' || *rest == '\t'))
+        rest++;
+
     if (p2)
-        strncpy(p2, token, 255);
-    if (strtok(NULL, " \t\n\r"))
-        return PARSE_ERROR_INVALID_FORMAT;
+        strncpy(p2, rest, 255);
+
     return PARSE_SUCCESS_TWO_PAYLOADS;
 }
 
@@ -121,10 +255,10 @@ void process_keyboard_input(SensorState *state)
     char command_buffer[MAX_MSG_SIZE];
     if (fgets(command_buffer, sizeof(command_buffer), stdin) == NULL)
     {
-        printf("\n[CLIENT] EOF detectado. A preparar para encerrar...\n");
-        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->sl_sensor_id, NULL);
+        printf("\n[CLIENT] EOF DETECTED\n");
+        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->sensor_id, NULL);
         send(state->sl_fd, state->send_buffer, strlen(state->send_buffer), 0);
-        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->ss_sensor_id, NULL);
+        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->sensor_id, NULL);
         send(state->ss_fd, state->send_buffer, strlen(state->send_buffer), 0);
         return;
     }
@@ -140,11 +274,15 @@ void process_keyboard_input(SensorState *state)
     {
 
         printf("[CLIENT] kill\n");
-        printf("[CLIENT] Sending REQ_DISCSEN %s\n", state->ss_sensor_id);
-        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->sl_sensor_id, NULL);
+        printf("[CLIENT] Sending REQ_DISCSEN %s\n", state->sensor_id);
+        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->sensor_id, NULL);
         send(state->sl_fd, state->send_buffer, strlen(state->send_buffer), 0);
-        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->ss_sensor_id, NULL);
+        build_message(state->send_buffer, sizeof(state->send_buffer), REQ_DISCSEN, state->sensor_id, NULL);
         send(state->ss_fd, state->send_buffer, strlen(state->send_buffer), 0);
+        if (strlen(state->sensor_id) > 0)
+        {
+            remove_id_from_file(state->sensor_id);
+        }
     }
     else if (strcmp(command, "check") == 0)
     {
@@ -152,8 +290,8 @@ void process_keyboard_input(SensorState *state)
         if (arg && strcmp(arg, "failure") == 0)
         {
             printf("[CLIENT] check failure\n");
-            printf("[CLIENT] Sending REQ_SENSSTATUS %s\n", state->ss_sensor_id);
-            build_message(state->send_buffer, sizeof(state->send_buffer), REQ_SENSSTATUS, state->ss_sensor_id, NULL);
+            printf("[CLIENT] Sending REQ_SENSSTATUS %s\n", state->sensor_id);
+            build_message(state->send_buffer, sizeof(state->send_buffer), REQ_SENSSTATUS, state->sensor_id, NULL);
             send(state->ss_fd, state->send_buffer, strlen(state->send_buffer), 0);
         }
     }
@@ -176,7 +314,7 @@ void process_keyboard_input(SensorState *state)
         {
             printf("[CLIENT] diagnose %s\n", target_loc);
             printf("[CLIENT] Sending REQ_LOCLIST %s\n", target_loc);
-            build_message(state->send_buffer, sizeof(state->send_buffer), REQ_LOCLIST, state->sl_sensor_id, target_loc);
+            build_message(state->send_buffer, sizeof(state->send_buffer), REQ_LOCLIST, state->sensor_id, target_loc);
             send(state->sl_fd, state->send_buffer, strlen(state->send_buffer), 0);
         }
     }
@@ -208,15 +346,15 @@ void process_server_message(int server_fd, SensorState *state)
     case RES_CONNSEN:
         if (server_fd == state->sl_fd)
         {
-            strncpy(state->sl_sensor_id, p1, sizeof(state->sl_sensor_id) - 1);
+            strncpy(state->sensor_id, p1, sizeof(state->sensor_id) - 1);
             state->registered_on_sl = 1;
-            printf("[CLIENTE] SS New ID:: %s\n", state->sl_sensor_id);
+            printf("[CLIENTE] SS New ID:: %s\n", state->sensor_id);
         }
         else if (server_fd == state->ss_fd)
         {
-            strncpy(state->ss_sensor_id, p1, sizeof(state->ss_sensor_id) - 1);
+            strncpy(state->sensor_id, p1, sizeof(state->sensor_id) - 1);
             state->registered_on_ss = 1;
-            printf("[CLIENTE] SL New ID:: %s\n", state->ss_sensor_id);
+            printf("[CLIENTE] SL New ID:: %s\n", state->sensor_id);
         }
         break;
     case 41: // RES_LOCLIST && RES_SENSSTATUS
@@ -234,7 +372,7 @@ void process_server_message(int server_fd, SensorState *state)
         printf("[CLIENT] Current sensor %s location: %s\n", p1, p2);
         break;
     case MSG_ERROR:
-        printf("[CLIENT] %s\n", p2);
+        printf("[CLIENT] %s\n", get_error_message(p1));
         break;
     case MSG_OK:
         if (p1[0] == '1')
@@ -284,7 +422,7 @@ int main(int argc, char *argv[])
 
     SensorState state = {0};
 
-    printf("Cliente (sensor) a iniciar na localização %d...\n", location_id);
+    generate_unique_sensor_id(state.sensor_id, sizeof(state.sensor_id));
 
     state.sl_fd = connect_to_server(server_ip, sl_port);
     if (state.sl_fd == SOCKET_ERROR)
@@ -299,7 +437,7 @@ int main(int argc, char *argv[])
 
     char location_id_str[4];
     snprintf(location_id_str, sizeof(location_id_str), "%d", location_id);
-    build_message(state.send_buffer, sizeof(state.send_buffer), REQ_CONNSEN, location_id_str, NULL);
+    build_message(state.send_buffer, sizeof(state.send_buffer), REQ_CONNSEN, state.sensor_id, location_id_str);
 
     printf("[CLIENT->SL] Sending REQ_CONNSEN: \"%s\"\n", state.send_buffer);
     if (send(state.sl_fd, state.send_buffer, strlen(state.send_buffer), 0) < 0)
@@ -322,7 +460,6 @@ int main(int argc, char *argv[])
         read_fds = master_set;
         if (state.registered_on_sl && state.registered_on_ss)
         {
-            printf("\n> ");
             fflush(stdout);
         }
 
@@ -343,7 +480,7 @@ int main(int argc, char *argv[])
                     {
                         char temp_buf[1024];
                         fgets(temp_buf, sizeof(temp_buf), stdin);
-                        printf("[CLIENT] Por favor, aguarde o registo ser completado.\n");
+                        printf("[CLIENT] Wait the register.\n");
                     }
                 }
                 else if (i == state.sl_fd || i == state.ss_fd)
